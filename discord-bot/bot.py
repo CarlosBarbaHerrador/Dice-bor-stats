@@ -161,6 +161,10 @@ class DiceBot(discord.Client):
             await self.cmd_set(message, stats)
             return
 
+        if message.content.startswith("!remove"):
+            await self.cmd_remove(message, stats)
+            return
+
         bot_name = message.author.name.lower()
 
         if "dice maiden" in bot_name or "dicemaiden" in bot_name:
@@ -358,6 +362,53 @@ class DiceBot(discord.Client):
         await message.channel.send(
             f"✅ Se han actualizado los **{label}** de <@{uid}> a `{valor}`."
         )
+
+
+    async def cmd_remove(self, message: discord.Message, stats: dict):
+        if not message.guild:
+            await message.channel.send("❌ Este comando solo puede usarse en un servidor.")
+            return
+
+        member_author = message.guild.get_member(message.author.id)
+        if not member_author or not member_author.guild_permissions.administrator:
+            await message.channel.send("🚫 No tienes permiso para esto.")
+            return
+
+        parts = message.content.strip().split(maxsplit=1)
+        target_name = parts[1].strip() if len(parts) == 2 else ""
+
+        removed: list[str] = []
+
+        # 1. Limpieza automática: eliminar entradas sin ID numérico
+        non_numeric = [k for k in list(stats.keys()) if not k.isdigit()]
+        for key in non_numeric:
+            entry_name = stats[key].get("name", key)
+            del stats[key]
+            removed.append(entry_name)
+
+        # 2. Si se indicó un nombre, buscar y borrar esa entrada concreta
+        if target_name:
+            target_lower = target_name.lower()
+            keys_to_delete = [
+                k for k, v in stats.items()
+                if v.get("name", "").lower() == target_lower or k.lower() == target_lower
+            ]
+            for key in keys_to_delete:
+                entry_name = stats[key].get("name", key)
+                del stats[key]
+                if entry_name not in removed:
+                    removed.append(entry_name)
+
+        if removed:
+            save_stats(stats)
+            lines = [f"🗑️ Entrada **{name}** eliminada del marcador." for name in removed]
+            await message.channel.send("\n".join(lines))
+        elif target_name:
+            await message.channel.send(
+                f"⚠️ No se encontró ninguna entrada con el nombre `{target_name}`."
+            )
+        else:
+            await message.channel.send("✅ El marcador ya estaba limpio.")
 
 
 def main():
