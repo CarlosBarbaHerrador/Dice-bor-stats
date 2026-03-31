@@ -6,16 +6,6 @@ from pathlib import Path
 
 STATS_FILE = Path(__file__).parent / "stats.json"
 
-DICE_MAIDEN_PATTERN = re.compile(
-    r"(?:(\S.*?)\s+Request\b.*?\n)?.*?(\d+)d(\d+)\s+Roll:\s+\[(\d+)\]",
-    re.IGNORECASE | re.DOTALL
-)
-
-AVRAE_PATTERN = re.compile(
-    r"(?:<@!?(\d+)>.*?)?(\d+)d(\d+)[^(]*\((\d+)\)",
-    re.IGNORECASE
-)
-
 MENTION_IN_EMBED_PATTERN = re.compile(r"<@!?(\d+)>")
 
 
@@ -77,10 +67,6 @@ class DiceBot(discord.Client):
             await self.cmd_marcador(message, stats)
             return
 
-        if message.author.bot:
-            await self.process_bot_message(message, stats)
-
-    async def process_bot_message(self, message: discord.Message, stats: dict):
         bot_name = message.author.name.lower()
 
         if "dice maiden" in bot_name or "dicemaiden" in bot_name:
@@ -91,15 +77,16 @@ class DiceBot(discord.Client):
     async def handle_dice_maiden(self, message: discord.Message, stats: dict):
         content = message.content
 
-        match = re.search(
-            r"^(.*?)\s+Request\b",
-            content,
-            re.MULTILINE | re.IGNORECASE
-        )
-
         player_name = None
-        if match:
-            player_name = match.group(1).strip()
+        player_id = None
+
+        name_match = re.search(
+            r"🎲\s*(.*?)\s+Request\b",
+            content,
+            re.IGNORECASE
+        )
+        if name_match:
+            player_name = name_match.group(1).strip()
             player_id = player_name.lower().replace(" ", "_")
         else:
             mention_match = MENTION_IN_EMBED_PATTERN.search(content)
@@ -112,17 +99,17 @@ class DiceBot(discord.Client):
                 return
 
         roll_match = re.search(
-            r"(\d+)d(\d+)\s+Roll:\s+\[(\d+)\]",
+            r"(\d+)d(\d+).*?Roll:.*?\[(\d+)\]",
             content,
-            re.IGNORECASE
+            re.IGNORECASE | re.DOTALL
         )
         if not roll_match:
             return
 
-        max_val = int(roll_match.group(2))
-        result = int(roll_match.group(3))
+        caras = int(roll_match.group(2))
+        resultado = int(roll_match.group(3))
 
-        msg = register_roll(stats, player_id, player_name, result, max_val)
+        msg = register_roll(stats, player_id, player_name, resultado, caras)
         if msg:
             await message.channel.send(msg)
 
