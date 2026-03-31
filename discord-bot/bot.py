@@ -157,6 +157,10 @@ class DiceBot(discord.Client):
             await self.cmd_marcador(message, stats)
             return
 
+        if message.content.startswith("!set"):
+            await self.cmd_set(message, stats)
+            return
+
         bot_name = message.author.name.lower()
 
         if "dice maiden" in bot_name or "dicemaiden" in bot_name:
@@ -289,6 +293,71 @@ class DiceBot(discord.Client):
             )
 
         await message.channel.send("\n".join(lines))
+
+
+    async def cmd_set(self, message: discord.Message, stats: dict):
+        CAMPOS_VALIDOS = {"criticos", "pifias", "tiradas"}
+        CAMPO_LABEL = {"criticos": "Críticos", "pifias": "Pifias", "tiradas": "Tiradas"}
+
+        if not message.guild:
+            await message.channel.send("❌ Este comando solo puede usarse en un servidor.")
+            return
+
+        member_author = message.guild.get_member(message.author.id)
+        if not member_author or not member_author.guild_permissions.administrator:
+            await message.channel.send("🚫 No tienes permiso para esto.")
+            return
+
+        parts = message.content.strip().split()
+        if len(parts) != 4:
+            await message.channel.send(
+                "❌ Formato incorrecto. Usa: `!set @usuario criticos/pifias/tiradas número`"
+            )
+            return
+
+        _, mention_raw, campo, valor_raw = parts
+        campo = campo.lower()
+
+        if campo not in CAMPOS_VALIDOS:
+            await message.channel.send(
+                f"❌ Campo inválido. Usa uno de: `criticos`, `pifias`, `tiradas`."
+            )
+            return
+
+        try:
+            valor = int(valor_raw)
+            if valor < 0:
+                raise ValueError
+        except ValueError:
+            await message.channel.send("❌ El número debe ser un entero positivo.")
+            return
+
+        mention_match = MENTION_IN_EMBED_PATTERN.search(mention_raw)
+        if not mention_match:
+            await message.channel.send("❌ Debes mencionar a un usuario con @.")
+            return
+
+        uid = mention_match.group(1)
+        target_member = message.guild.get_member(int(uid))
+        display_name = target_member.display_name if target_member else f"Usuario {uid}"
+
+        if uid not in stats:
+            stats[uid] = {
+                "name": display_name,
+                "criticos": 0,
+                "pifias": 0,
+                "tiradas": 0,
+            }
+        else:
+            stats[uid]["name"] = display_name
+
+        stats[uid][campo] = valor
+        save_stats(stats)
+
+        label = CAMPO_LABEL[campo]
+        await message.channel.send(
+            f"✅ Se han actualizado los **{label}** de <@{uid}> a `{valor}`."
+        )
 
 
 def main():
