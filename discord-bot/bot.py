@@ -236,7 +236,18 @@ class DiceBot(discord.Client):
     async def handle_avrae(self, message: discord.Message, stats: dict):
         content = message.content
 
-        # Recopilar todo el texto del mensaje y sus embeds
+        # ── Debug: registrar exactamente lo que llega ──────────────────────
+        print(f"[Avrae] content: {repr(content[:300])}")
+        print(f"[Avrae] embeds: {len(message.embeds)}")
+        for i, embed in enumerate(message.embeds):
+            print(f"  embed[{i}] author={repr(getattr(embed.author, 'name', None))}")
+            print(f"  embed[{i}] title={repr(embed.title)}")
+            print(f"  embed[{i}] description={repr(embed.description[:200] if embed.description else None)}")
+            for j, field in enumerate(embed.fields):
+                print(f"  embed[{i}] field[{j}] name={repr(field.name)} value={repr(field.value[:100] if field.value else None)}")
+        # ───────────────────────────────────────────────────────────────────
+
+        # Recopilar todo el texto escaneable
         embed_parts: list[str] = []
         if message.embeds:
             for embed in message.embeds:
@@ -254,44 +265,73 @@ class DiceBot(discord.Client):
 
         full_text = content + ("\n" + "\n".join(embed_parts) if embed_parts else "")
 
-        # Patrones de tirada de Avrae (de más específico a más general):
-        # "Result: 1d20 (20)", "1d20 (20)", "**1d20** (20)"
-        roll_patterns = [
-            r"[Rr]esult:.*?(\d+)d(\d+)[^()\n]*\((\d+)\)",
-            r"(\d+)d(\d+)[^()\n]*\((\d+)\)",
-        ]
-        roll_match = None
-        for pattern in roll_patterns:
-            roll_match = re.search(pattern, full_text, re.IGNORECASE)
+        # ── Detección de la tirada ─────────────────────────────────────────
+        # Patrón 1 (específico): "Result: 1d20 (20)"
+        #   grupo 1 = caras, grupo 2 = resultado
+        roll_match = re.search(
+            r"Result:\s*\d+d(\d+)\s*\((\d+)\)",
+            full_text,
+            re.IGNORECASE,
+        )
+        if roll_match:
+            caras = int(roll_match.group(1))
+            resultado = int(roll_match.group(2))
+            print(f"[Avrae] Patrón 'Result' → caras={caras}, resultado={resultado}")
+        else:
+            # Patrón 2 (general): "1d20 (20)" o "**1d20** (20)"
+            roll_match = re.search(
+                r"(\d+)d(\d+)[^()\n]*\((\d+)\)",
+                full_text,
+                re.IGNORECASE,
+            )
             if roll_match:
-                break
+                caras = int(roll_match.group(2))
+                resultado = int(roll_match.group(3))
+                print(f"[Avrae] Patrón general → caras={caras}, resultado={resultado}")
+            else:
+                print("[Avrae] Ningún patrón coincidió. Sin tirada detectada.")
+                return
 
-        if not roll_match:
-            return
+        # ── Identificación del jugador ─────────────────────────────────────
+        # Avrae pone la mención al inicio de message.content: "<@ID> 🎲"
+        # Si no está ahí, buscamos en todo el texto y luego en títulos de embed.
+        uid: str | None = None
 
-        caras = int(roll_match.group(2))
-        resultado = int(roll_match.group(3))
-
-        # Identificar al jugador:
-        # Avrae pone la mención al inicio del message.content, ej: "<@123> 🎲"
-        # Intentamos primero el inicio del contenido, luego el texto completo
-        player = None
         start_mention = MENTION_IN_EMBED_PATTERN.match(content.strip())
         if start_mention:
             uid = start_mention.group(1)
+            print(f"[Avrae] Mención al inicio del content: {uid}")
+
+        if not uid:
+            any_mention = MENTION_IN_EMBED_PATTERN.search(content)
+            if any_mention:
+                uid = any_mention.group(1)
+                print(f"[Avrae] Mención en content: {uid}")
+
+        if not uid and message.embeds:
+            for embed in message.embeds:
+                if embed.title:
+                    title_mention = MENTION_IN_EMBED_PATTERN.search(embed.title)
+                    if title_mention:
+                        uid = title_mention.group(1)
+                        print(f"[Avrae] Mención en título del embed: {uid}")
+                        break
+
+        if uid:
             member = message.guild.get_member(int(uid)) if message.guild else None
             display_name = member.display_name if member else f"Usuario {uid}"
-            player = (uid, display_name)
-
-        if not player:
-            player = await self.resolve_player(full_text, message)
-
-        if not player:
-            uid = "unknown"
-            display_name = "Jugador desconocido"
         else:
-            uid, display_name = player
+            print("[Avrae] Sin mención. Buscando en historial del canal.")
+            invoker = await find_command_invoker(message.channel, message)
+            if invoker:
+                uid = str(invoker.id)
+                display_name = invoker.display_name
+                print(f"[Avrae] Encontrado en historial: {uid} ({display_name})")
+            else:
+                uid = "unknown"
+                display_name = "Jugador desconocido"
 
+        print(f"[Avrae] Registrando: uid={uid}, name={display_name}, resultado={resultado}/{caras}")
         msg = register_roll(stats, uid, display_name, resultado, caras)
         if msg:
             await message.channel.send(msg)
