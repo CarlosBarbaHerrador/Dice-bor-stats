@@ -235,27 +235,57 @@ class DiceBot(discord.Client):
 
     async def handle_avrae(self, message: discord.Message, stats: dict):
         content = message.content
-        full_text = content
 
+        # Recopilar todo el texto del mensaje y sus embeds
+        embed_parts: list[str] = []
         if message.embeds:
             for embed in message.embeds:
+                if embed.author and embed.author.name:
+                    embed_parts.append(embed.author.name)
+                if embed.title:
+                    embed_parts.append(embed.title)
                 if embed.description:
-                    full_text += "\n" + embed.description
+                    embed_parts.append(embed.description)
                 for field in embed.fields:
-                    full_text += "\n" + field.value
+                    if field.name:
+                        embed_parts.append(field.name)
+                    if field.value:
+                        embed_parts.append(field.value)
 
-        roll_match = re.search(
-            r"(\d+)d(\d+)[^(]*\((\d+)\)",
-            full_text,
-            re.IGNORECASE,
-        )
+        full_text = content + ("\n" + "\n".join(embed_parts) if embed_parts else "")
+
+        # Patrones de tirada de Avrae (de más específico a más general):
+        # "Result: 1d20 (20)", "1d20 (20)", "**1d20** (20)"
+        roll_patterns = [
+            r"[Rr]esult:.*?(\d+)d(\d+)[^()\n]*\((\d+)\)",
+            r"(\d+)d(\d+)[^()\n]*\((\d+)\)",
+        ]
+        roll_match = None
+        for pattern in roll_patterns:
+            roll_match = re.search(pattern, full_text, re.IGNORECASE)
+            if roll_match:
+                break
+
         if not roll_match:
             return
 
         caras = int(roll_match.group(2))
         resultado = int(roll_match.group(3))
 
-        player = await self.resolve_player(full_text, message)
+        # Identificar al jugador:
+        # Avrae pone la mención al inicio del message.content, ej: "<@123> 🎲"
+        # Intentamos primero el inicio del contenido, luego el texto completo
+        player = None
+        start_mention = MENTION_IN_EMBED_PATTERN.match(content.strip())
+        if start_mention:
+            uid = start_mention.group(1)
+            member = message.guild.get_member(int(uid)) if message.guild else None
+            display_name = member.display_name if member else f"Usuario {uid}"
+            player = (uid, display_name)
+
+        if not player:
+            player = await self.resolve_player(full_text, message)
+
         if not player:
             uid = "unknown"
             display_name = "Jugador desconocido"
