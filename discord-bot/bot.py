@@ -7,6 +7,12 @@ from pathlib import Path
 STATS_FILE = Path(__file__).parent / "stats.json"
 
 MENTION_IN_EMBED_PATTERN = re.compile(r"<@!?(\d+)>")
+MARKDOWN_BOLD = re.compile(r"\*{1,2}")
+
+
+def strip_markdown(text: str) -> str:
+    """Elimina asteriscos de negrita/cursiva de un texto."""
+    return MARKDOWN_BOLD.sub("", text).strip()
 
 
 def load_stats() -> dict:
@@ -21,49 +27,63 @@ def save_stats(stats: dict) -> None:
         json.dump(stats, f, ensure_ascii=False, indent=2)
 
 
+def merge_entry(target: dict, source: dict) -> None:
+    """Suma las estadísticas de source en target."""
+    target["criticos"] = target.get("criticos", 0) + source.get("criticos", 0)
+    target["pifias"] = target.get("pifias", 0) + source.get("pifias", 0)
+    target["tiradas"] = target.get("tiradas", 0) + source.get("tiradas", 0)
+
+
 def migrate_stats(stats: dict) -> dict:
     """
-    Migra entradas antiguas con clave "user_XXXXXXX" a solo "XXXXXXX".
-    Fusiona entradas duplicadas si se detectan.
+    - Elimina asteriscos de claves y nombres.
+    - Migra claves "user_XXXXXXX" → "XXXXXXX".
+    - Fusiona entradas duplicadas detectadas por nombre normalizado.
     """
     changed = False
-    keys_to_rename = {}
+    new_stats: dict = {}
 
-    for key in list(stats.keys()):
-        if key.startswith("user_"):
-            new_key = key[len("user_"):]
-            keys_to_rename[key] = new_key
+    for key, data in stats.items():
+        clean_key = strip_markdown(key)
 
-    for old_key, new_key in keys_to_rename.items():
-        entry = stats.pop(old_key)
-        if new_key in stats:
-            existing = stats[new_key]
-            existing["criticos"] += entry.get("criticos", 0)
-            existing["pifias"] += entry.get("pifias", 0)
-            existing["tiradas"] += entry.get("tiradas", 0)
+        if clean_key.startswith("user_"):
+            clean_key = clean_key[len("user_"):]
+
+        clean_name = strip_markdown(data.get("name", clean_key))
+        data["name"] = clean_name
+
+        if clean_key in new_stats:
+            merge_entry(new_stats[clean_key], data)
+            changed = True
+            print(f"[Migración] Fusionadas entradas duplicadas: '{key}' → '{clean_key}'")
         else:
-            stats[new_key] = entry
-        changed = True
+            new_stats[clean_key] = data
+            if clean_key != key:
+                changed = True
+                print(f"[Migración] Clave renombrada: '{key}' → '{clean_key}'")
 
     if changed:
+        stats.clear()
+        stats.update(new_stats)
         save_stats(stats)
-        print(f"[Migración] {len(keys_to_rename)} entrada(s) migradas.")
+        print(f"[Migración] Stats guardadas. Total de jugadores: {len(stats)}")
 
     return stats
 
 
 def get_or_create_entry(stats: dict, uid: str, display_name: str) -> dict:
+    clean_name = strip_markdown(display_name)
     if uid not in stats:
         stats[uid] = {
-            "name": display_name,
+            "name": clean_name,
             "criticos": 0,
             "pifias": 0,
             "tiradas": 0,
         }
     else:
-        if stats[uid].get("name") != display_name:
-            print(f"[Nombre actualizado] {stats[uid]['name']} → {display_name}")
-            stats[uid]["name"] = display_name
+        if stats[uid].get("name") != clean_name:
+            print(f"[Nombre actualizado] {stats[uid]['name']} → {clean_name}")
+            stats[uid]["name"] = clean_name
     return stats[uid]
 
 
@@ -74,29 +94,47 @@ def register_roll(
     resultado: int,
     caras: int,
 ) -> str | None:
-    entry = get_or_create_entry(stats, uid, display_name)
+    clean_name = strip_markdown(display_name)
+    entry = get_or_create_entry(stats, uid, clean_name)
     entry["tiradas"] += 1
 
     if resultado == caras:
         entry["criticos"] += 1
         save_stats(stats)
-        return f"🎯 **¡CRÍTICO!** {display_name} sacó {resultado} en un d{caras}!"
+        return f"🎯 **¡CRÍTICO!** {clean_name} sacó {resultado} en un d{caras}!"
 
     if resultado == 1:
         entry["pifias"] += 1
         save_stats(stats)
-        return f"💀 **¡PIFIA!** {display_name} sacó 1 en un d{caras}!"
+        return f"💀 **¡PIFIA!** {clean_name} sacó 1 en un d{caras}!"
 
     save_stats(stats)
     return None
 
 
 def resolve_member_by_name(guild: discord.Guild, name: str) -> discord.Member | None:
-    """Busca un miembro del servidor cuyo display_name o name coincida (sin distinción de mayúsculas)."""
-    name_lower = name.lower()
+    """Busca miembro por display_name o name (sin distinción de mayúsculas)."""
+    clean = strip_markdown(name).lower()
     for member in guild.members:
-        if member.display_name.lower() == name_lower or member.name.lower() == name_lower:
+        if member.display_name.lower() == clean or member.name.lower() == clean:
             return member
+    return None
+
+
+async def find_command_invoker(
+    channel: discord.abc.Messageable,
+    bot_message: discord.Message,
+) -> discord.Member | None:
+    """
+    Busca en el historial reciente el último mensaje de un humano
+    antes del mensaje del bot de dados, que sea el comando de tirada.
+    """
+    try:
+        async for msg in channel.history(limit=10, before=bot_message):
+            if not msg.author.bot:
+                return msg.author
+    except (discord.Forbidden, discord.HTTPException):
+        pass
     return None
 
 
@@ -126,34 +164,46 @@ class DiceBot(discord.Client):
         elif "avrae" in bot_name:
             await self.handle_avrae(message, stats)
 
-    async def handle_dice_maiden(self, message: discord.Message, stats: dict):
-        content = message.content
-
-        uid = None
-        display_name = None
-
+    async def resolve_player(
+        self,
+        content: str,
+        message: discord.Message,
+    ) -> tuple[str, str] | None:
+        """
+        Intenta obtener (uid, display_name) de un mensaje:
+        1. Mención directa en el contenido.
+        2. Nombre entre 🎲 y Request → busca miembro en el servidor.
+        3. Historial del canal → primer humano antes del mensaje.
+        Devuelve None si no puede identificar al jugador.
+        """
+        # 1. Mención directa
         mention_match = MENTION_IN_EMBED_PATTERN.search(content)
         if mention_match:
             uid = mention_match.group(1)
             member = message.guild.get_member(int(uid)) if message.guild else None
             display_name = member.display_name if member else f"Usuario {uid}"
-        else:
-            name_match = re.search(r"🎲\s*(.*?)\s+Request\b", content, re.IGNORECASE)
-            if name_match:
-                extracted_name = name_match.group(1).strip()
-                if message.guild:
-                    member = resolve_member_by_name(message.guild, extracted_name)
-                    if member:
-                        uid = str(member.id)
-                        display_name = member.display_name
-                    else:
-                        uid = extracted_name.lower().replace(" ", "_")
-                        display_name = extracted_name
-                else:
-                    uid = extracted_name.lower().replace(" ", "_")
-                    display_name = extracted_name
-            else:
-                return
+            return uid, display_name
+
+        # 2. Nombre entre 🎲 y Request
+        name_match = re.search(r"🎲\s*(.*?)\s+Request\b", content, re.IGNORECASE)
+        if name_match:
+            extracted = strip_markdown(name_match.group(1).strip())
+            if message.guild:
+                member = resolve_member_by_name(message.guild, extracted)
+                if member:
+                    return str(member.id), member.display_name
+            uid = extracted.lower().replace(" ", "_")
+            return uid, extracted
+
+        # 3. Historial: quien ejecutó el comando
+        invoker = await find_command_invoker(message.channel, message)
+        if invoker:
+            return str(invoker.id), invoker.display_name
+
+        return None
+
+    async def handle_dice_maiden(self, message: discord.Message, stats: dict):
+        content = message.content
 
         roll_match = re.search(
             r"(\d+)d(\d+).*?Roll:.*?\[(\d+)\]",
@@ -166,6 +216,11 @@ class DiceBot(discord.Client):
         caras = int(roll_match.group(2))
         resultado = int(roll_match.group(3))
 
+        player = await self.resolve_player(content, message)
+        if not player:
+            return
+
+        uid, display_name = player
         msg = register_roll(stats, uid, display_name, resultado, caras)
         if msg:
             await message.channel.send(msg)
@@ -181,18 +236,6 @@ class DiceBot(discord.Client):
                 for field in embed.fields:
                     full_text += "\n" + field.value
 
-        mention_match = MENTION_IN_EMBED_PATTERN.search(full_text)
-        uid = None
-        display_name = None
-
-        if mention_match:
-            uid = mention_match.group(1)
-            member = message.guild.get_member(int(uid)) if message.guild else None
-            display_name = member.display_name if member else f"Usuario {uid}"
-        else:
-            uid = "unknown"
-            display_name = "Jugador desconocido"
-
         roll_match = re.search(
             r"(\d+)d(\d+)[^(]*\((\d+)\)",
             full_text,
@@ -203,6 +246,13 @@ class DiceBot(discord.Client):
 
         caras = int(roll_match.group(2))
         resultado = int(roll_match.group(3))
+
+        player = await self.resolve_player(full_text, message)
+        if not player:
+            uid = "unknown"
+            display_name = "Jugador desconocido"
+        else:
+            uid, display_name = player
 
         msg = register_roll(stats, uid, display_name, resultado, caras)
         if msg:
@@ -221,15 +271,13 @@ class DiceBot(discord.Client):
 
         lines = ["📊 **Marcador de dados**\n"]
         for uid, data in sorted_players:
-            if uid.isdigit() and message.guild:
-                member = message.guild.get_member(int(uid))
-                if member:
-                    if data.get("name") != member.display_name:
+            if uid.isdigit():
+                if message.guild:
+                    member = message.guild.get_member(int(uid))
+                    if member and data.get("name") != member.display_name:
                         data["name"] = member.display_name
                         save_stats(stats)
-                    name_display = f"<@{uid}>"
-                else:
-                    name_display = f"**{data.get('name', uid)}**"
+                name_display = f"<@{uid}>"
             else:
                 name_display = f"**{data.get('name', uid)}**"
 
