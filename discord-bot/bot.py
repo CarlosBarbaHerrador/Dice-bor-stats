@@ -3,6 +3,7 @@ import re
 import json
 import os
 from pathlib import Path
+from keep_alive import keep_alive
 
 STATS_FILE = Path(__file__).parent / "stats.json"
 
@@ -636,6 +637,7 @@ def main():
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("La variable de entorno DISCORD_TOKEN no está configurada.")
+    keep_alive()
     bot = DiceBot()
     bot.run(token)
 
