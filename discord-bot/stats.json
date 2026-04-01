@@ -1,1 +1,15 @@
-{}
+{
+  "553675740646866944": {
+    "name": "Raboloko",
+    "criticos": 0,
+    "pifias": 1,
+    "tiradas": 1,
+    "dados": {
+      "d2": {
+        "tiradas": 1,
+        "criticos": 0,
+        "pifias": 1
+      }
+    }
+  }
+}
