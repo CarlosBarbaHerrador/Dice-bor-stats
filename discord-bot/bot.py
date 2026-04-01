@@ -391,11 +391,10 @@ class DiceBot(discord.Client):
                 desglose = "sin datos"
 
             lines.append(
-                f"{name_display} — 🎯 `{criticos}` | 💀 `{pifias}`\n"
-                f"　　{desglose} | 🎲 Total: `{tiradas}`"
+                f"{name_display} — 🎯: `{criticos}` | 💀: `{pifias}` | 🎲 {desglose} | **Total: {tiradas}**"
             )
 
-        lines.append(f"\n🎲 Total de dados lanzados en el servidor: **{total_servidor}**")
+        lines.append(f"{'─' * 35}\n🎲 Total de dados lanzados en el servidor: **{total_servidor}**")
         await message.channel.send("\n".join(lines))
 
 
