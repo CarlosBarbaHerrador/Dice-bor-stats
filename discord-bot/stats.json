@@ -5,10 +5,26 @@
     "pifias": 0,
     "tiradas": 4,
     "dados": {
-      "d2": 1,
-      "d5": 1,
-      "d10": 1,
-      "d54": 1
+      "d2": {
+        "tiradas": 1,
+        "criticos": 0,
+        "pifias": 0
+      },
+      "d5": {
+        "tiradas": 1,
+        "criticos": 0,
+        "pifias": 0
+      },
+      "d10": {
+        "tiradas": 1,
+        "criticos": 0,
+        "pifias": 0
+      },
+      "d54": {
+        "tiradas": 1,
+        "criticos": 0,
+        "pifias": 0
+      }
     }
   }
 }

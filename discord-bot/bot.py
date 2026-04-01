@@ -27,14 +27,28 @@ def save_stats(stats: dict) -> None:
         json.dump(stats, f, ensure_ascii=False, indent=2)
 
 
+def get_dado_sub(dados: dict, dado_key: str) -> dict:
+    """Devuelve (y crea si falta) el subdict {tiradas, criticos, pifias} de un dado."""
+    val = dados.get(dado_key)
+    if not isinstance(val, dict):
+        dados[dado_key] = {"tiradas": val if isinstance(val, int) else 0, "criticos": 0, "pifias": 0}
+    return dados[dado_key]
+
+
 def merge_entry(target: dict, source: dict) -> None:
     """Suma las estadísticas de source en target, incluyendo el desglose de dados."""
     target["criticos"] = target.get("criticos", 0) + source.get("criticos", 0)
     target["pifias"] = target.get("pifias", 0) + source.get("pifias", 0)
     target["tiradas"] = target.get("tiradas", 0) + source.get("tiradas", 0)
     target_dados = target.setdefault("dados", {})
-    for dado, count in source.get("dados", {}).items():
-        target_dados[dado] = target_dados.get(dado, 0) + count
+    for dado_key, dado_val in source.get("dados", {}).items():
+        t = get_dado_sub(target_dados, dado_key)
+        if isinstance(dado_val, int):
+            t["tiradas"] += dado_val
+        else:
+            t["tiradas"] += dado_val.get("tiradas", 0)
+            t["criticos"] += dado_val.get("criticos", 0)
+            t["pifias"] += dado_val.get("pifias", 0)
 
 
 def migrate_stats(stats: dict) -> dict:
@@ -66,10 +80,15 @@ def migrate_stats(stats: dict) -> dict:
                 print(f"[Migración] Clave renombrada: '{key}' → '{clean_key}'")
 
     # Asegurarse de que todas las entradas tengan el campo "dados"
+    # y que cada dado sea un dict {tiradas, criticos, pifias}
     for data in new_stats.values():
         if "dados" not in data:
             data["dados"] = {}
             changed = True
+        for dado_key, dado_val in list(data["dados"].items()):
+            if isinstance(dado_val, int):
+                data["dados"][dado_key] = {"tiradas": dado_val, "criticos": 0, "pifias": 0}
+                changed = True
 
     if changed:
         stats.clear()
@@ -112,15 +131,18 @@ def register_roll(
     entry["tiradas"] += 1
 
     dado_key = f"d{caras}"
-    entry["dados"][dado_key] = entry["dados"].get(dado_key, 0) + 1
+    dado_sub = get_dado_sub(entry["dados"], dado_key)
+    dado_sub["tiradas"] += 1
 
     if resultado == caras:
         entry["criticos"] += 1
+        dado_sub["criticos"] += 1
         save_stats(stats)
         return f"🎯 **¡CRÍTICO!** {clean_name} sacó {resultado} en un d{caras}!"
 
     if resultado == 1:
         entry["pifias"] += 1
+        dado_sub["pifias"] += 1
         save_stats(stats)
         return f"💀 **¡PIFIA!** {clean_name} sacó 1 en un d{caras}!"
 
@@ -171,6 +193,10 @@ class DiceBot(discord.Client):
 
         if message.content.startswith("!marcador"):
             await self.cmd_marcador(message, stats)
+            return
+
+        if message.content.startswith("!estadisticas"):
+            await self.cmd_estadisticas(message, stats)
             return
 
         if message.content.startswith("!set"):
@@ -375,18 +401,20 @@ class DiceBot(discord.Client):
 
             # Desglose de dados ordenado numéricamente
             dados: dict = data.get("dados", {})
-            if dados:
-                def dado_sort_key(k: str) -> int:
-                    try:
-                        return int(k[1:])
-                    except ValueError:
-                        return 0
 
-                desglose = " | ".join(
-                    f"{dado}: {count}"
-                    for dado, count in sorted(dados.items(), key=lambda x: dado_sort_key(x[0]))
-                    if count > 0
-                )
+            def dado_sort_key(k: str) -> int:
+                try:
+                    return int(k[1:])
+                except ValueError:
+                    return 0
+
+            if dados:
+                desglose_parts = []
+                for dado, val in sorted(dados.items(), key=lambda x: dado_sort_key(x[0])):
+                    t = val["tiradas"] if isinstance(val, dict) else val
+                    if t > 0:
+                        desglose_parts.append(f"{dado}: {t}")
+                desglose = " | ".join(desglose_parts) if desglose_parts else "sin datos"
             else:
                 desglose = "sin datos"
 
@@ -398,9 +426,80 @@ class DiceBot(discord.Client):
         await message.channel.send("\n".join(lines))
 
 
+    async def cmd_estadisticas(self, message: discord.Message, stats: dict):
+        if not stats:
+            await message.channel.send("📊 No hay estadísticas registradas aún.")
+            return
+
+        # Determinar si se filtra por un usuario concreto
+        mention_match = MENTION_IN_EMBED_PATTERN.search(message.content)
+        if mention_match:
+            uid_filter = mention_match.group(1)
+            players = [(uid_filter, stats[uid_filter])] if uid_filter in stats else []
+            if not players:
+                await message.channel.send("⚠️ Ese usuario no tiene estadísticas registradas.")
+                return
+        else:
+            players = sorted(
+                stats.items(),
+                key=lambda kv: kv[1].get("criticos", 0),
+                reverse=True,
+            )
+
+        def dado_sort_key(k: str) -> int:
+            try:
+                return int(k[1:])
+            except ValueError:
+                return 0
+
+        for uid, data in players:
+            name_display = f"<@{uid}>" if uid.isdigit() else data.get("name", uid)
+
+            embed = discord.Embed(
+                title=f"📊 Estadísticas de {data.get('name', uid)}",
+                color=discord.Color.blurple(),
+            )
+            embed.add_field(
+                name="Global",
+                value=(
+                    f"🎯 Críticos: **{data.get('criticos', 0)}**\n"
+                    f"💀 Pifias: **{data.get('pifias', 0)}**\n"
+                    f"🎲 Tiradas totales: **{data.get('tiradas', 0)}**"
+                ),
+                inline=False,
+            )
+
+            dados: dict = data.get("dados", {})
+            if dados:
+                lines_dado = []
+                for dado, val in sorted(dados.items(), key=lambda x: dado_sort_key(x[0])):
+                    if isinstance(val, dict):
+                        t = val.get("tiradas", 0)
+                        c = val.get("criticos", 0)
+                        p = val.get("pifias", 0)
+                    else:
+                        t, c, p = val, 0, 0
+                    if t > 0:
+                        lines_dado.append(f"**{dado}**: {t} tiradas | 🎯 {c} | 💀 {p}")
+                if lines_dado:
+                    embed.add_field(
+                        name="Desglose por dado",
+                        value="\n".join(lines_dado),
+                        inline=False,
+                    )
+
+            if uid.isdigit():
+                embed.set_footer(text=f"ID: {uid}")
+
+            await message.channel.send(content=name_display, embed=embed)
+
+
     async def cmd_set(self, message: discord.Message, stats: dict):
-        CAMPOS_VALIDOS = {"criticos", "pifias", "tiradas"}
+        # Campos globales
+        CAMPOS_GLOBALES = {"criticos", "pifias", "tiradas"}
         CAMPO_LABEL = {"criticos": "Críticos", "pifias": "Pifias", "tiradas": "Tiradas"}
+        # Campos por dado: patrón d<N>_(criticos|pifias|tiradas)
+        DADO_SUB_PATTERN = re.compile(r"^(d\d+)_(criticos|pifias|tiradas)$")
 
         if not message.guild:
             await message.channel.send("❌ Este comando solo puede usarse en un servidor.")
@@ -414,18 +513,14 @@ class DiceBot(discord.Client):
         parts = message.content.strip().split()
         if len(parts) != 4:
             await message.channel.send(
-                "❌ Formato incorrecto. Usa: `!set @usuario criticos/pifias/tiradas número`"
+                "❌ Formato incorrecto.\n"
+                "  Global: `!set @usuario criticos/pifias/tiradas número`\n"
+                "  Por dado: `!set @usuario d20_criticos/d20_pifias/d20_tiradas número`"
             )
             return
 
         _, mention_raw, campo, valor_raw = parts
         campo = campo.lower()
-
-        if campo not in CAMPOS_VALIDOS:
-            await message.channel.send(
-                f"❌ Campo inválido. Usa uno de: `criticos`, `pifias`, `tiradas`."
-            )
-            return
 
         try:
             valor = int(valor_raw)
@@ -445,21 +540,48 @@ class DiceBot(discord.Client):
         display_name = target_member.display_name if target_member else f"Usuario {uid}"
 
         if uid not in stats:
-            stats[uid] = {
-                "name": display_name,
-                "criticos": 0,
-                "pifias": 0,
-                "tiradas": 0,
-            }
+            stats[uid] = {"name": display_name, "criticos": 0, "pifias": 0, "tiradas": 0, "dados": {}}
         else:
+            stats[uid].setdefault("dados", {})
             stats[uid]["name"] = display_name
 
-        stats[uid][campo] = valor
-        save_stats(stats)
+        # Campo global
+        if campo in CAMPOS_GLOBALES:
+            stats[uid][campo] = valor
+            save_stats(stats)
+            await message.channel.send(
+                f"✅ **{CAMPO_LABEL[campo]}** de <@{uid}> actualizados a `{valor}`."
+            )
+            return
 
-        label = CAMPO_LABEL[campo]
+        # Campo por dado (d20_criticos, d10_pifias, etc.)
+        dado_match = DADO_SUB_PATTERN.match(campo)
+        if dado_match:
+            dado_key = dado_match.group(1)
+            sub_campo = dado_match.group(2)
+            dado_sub = get_dado_sub(stats[uid]["dados"], dado_key)
+            dado_sub[sub_campo] = valor
+            # Recalcular totales globales desde los dados
+            stats[uid]["tiradas"] = sum(
+                (v.get("tiradas", 0) if isinstance(v, dict) else v)
+                for v in stats[uid]["dados"].values()
+            )
+            stats[uid]["criticos"] = sum(
+                v.get("criticos", 0) for v in stats[uid]["dados"].values() if isinstance(v, dict)
+            )
+            stats[uid]["pifias"] = sum(
+                v.get("pifias", 0) for v in stats[uid]["dados"].values() if isinstance(v, dict)
+            )
+            save_stats(stats)
+            await message.channel.send(
+                f"✅ **{sub_campo}** de {dado_key} para <@{uid}> actualizado a `{valor}`."
+            )
+            return
+
         await message.channel.send(
-            f"✅ Se han actualizado los **{label}** de <@{uid}> a `{valor}`."
+            f"❌ Campo inválido: `{campo}`.\n"
+            "  Campos globales: `criticos`, `pifias`, `tiradas`.\n"
+            "  Campos por dado: `d20_criticos`, `d20_pifias`, `d20_tiradas`, etc."
         )
 
 
