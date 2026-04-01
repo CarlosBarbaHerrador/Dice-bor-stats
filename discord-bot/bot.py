@@ -28,10 +28,13 @@ def save_stats(stats: dict) -> None:
 
 
 def merge_entry(target: dict, source: dict) -> None:
-    """Suma las estadísticas de source en target."""
+    """Suma las estadísticas de source en target, incluyendo el desglose de dados."""
     target["criticos"] = target.get("criticos", 0) + source.get("criticos", 0)
     target["pifias"] = target.get("pifias", 0) + source.get("pifias", 0)
     target["tiradas"] = target.get("tiradas", 0) + source.get("tiradas", 0)
+    target_dados = target.setdefault("dados", {})
+    for dado, count in source.get("dados", {}).items():
+        target_dados[dado] = target_dados.get(dado, 0) + count
 
 
 def migrate_stats(stats: dict) -> dict:
@@ -62,6 +65,12 @@ def migrate_stats(stats: dict) -> dict:
                 changed = True
                 print(f"[Migración] Clave renombrada: '{key}' → '{clean_key}'")
 
+    # Asegurarse de que todas las entradas tengan el campo "dados"
+    for data in new_stats.values():
+        if "dados" not in data:
+            data["dados"] = {}
+            changed = True
+
     if changed:
         stats.clear()
         stats.update(new_stats)
@@ -79,11 +88,15 @@ def get_or_create_entry(stats: dict, uid: str, display_name: str) -> dict:
             "criticos": 0,
             "pifias": 0,
             "tiradas": 0,
+            "dados": {},
         }
     else:
-        if stats[uid].get("name") != clean_name:
-            print(f"[Nombre actualizado] {stats[uid]['name']} → {clean_name}")
-            stats[uid]["name"] = clean_name
+        entry = stats[uid]
+        if entry.get("name") != clean_name:
+            print(f"[Nombre actualizado] {entry['name']} → {clean_name}")
+            entry["name"] = clean_name
+        if "dados" not in entry:
+            entry["dados"] = {}
     return stats[uid]
 
 
@@ -97,6 +110,9 @@ def register_roll(
     clean_name = strip_markdown(display_name)
     entry = get_or_create_entry(stats, uid, clean_name)
     entry["tiradas"] += 1
+
+    dado_key = f"d{caras}"
+    entry["dados"][dado_key] = entry["dados"].get(dado_key, 0) + 1
 
     if resultado == caras:
         entry["criticos"] += 1
@@ -335,25 +351,51 @@ class DiceBot(discord.Client):
             reverse=True,
         )
 
-        lines = ["📊 **Marcador de dados**\n"]
+        # Actualizar nombres si el miembro sigue en el servidor
+        stats_changed = False
         for uid, data in sorted_players:
-            if uid.isdigit():
-                if message.guild:
-                    member = message.guild.get_member(int(uid))
-                    if member and data.get("name") != member.display_name:
-                        data["name"] = member.display_name
-                        save_stats(stats)
-                name_display = f"<@{uid}>"
-            else:
-                name_display = f"**{data.get('name', uid)}**"
+            if uid.isdigit() and message.guild:
+                member = message.guild.get_member(int(uid))
+                if member and data.get("name") != member.display_name:
+                    data["name"] = member.display_name
+                    stats_changed = True
+        if stats_changed:
+            save_stats(stats)
+
+        lines = ["📊 **Marcador de dados**\n"]
+        total_servidor = 0
+
+        for uid, data in sorted_players:
+            name_display = f"<@{uid}>" if uid.isdigit() else f"**{data.get('name', uid)}**"
 
             criticos = data.get("criticos", 0)
             pifias = data.get("pifias", 0)
             tiradas = data.get("tiradas", 0)
+            total_servidor += tiradas
+
+            # Desglose de dados ordenado numéricamente
+            dados: dict = data.get("dados", {})
+            if dados:
+                def dado_sort_key(k: str) -> int:
+                    try:
+                        return int(k[1:])
+                    except ValueError:
+                        return 0
+
+                desglose = " | ".join(
+                    f"{dado}: {count}"
+                    for dado, count in sorted(dados.items(), key=lambda x: dado_sort_key(x[0]))
+                    if count > 0
+                )
+            else:
+                desglose = "sin datos"
+
             lines.append(
-                f"{name_display} — 🎯 Críticos: `{criticos}` | 💀 Pifias: `{pifias}` | 🎲 Tiradas: `{tiradas}`"
+                f"{name_display} — 🎯 `{criticos}` | 💀 `{pifias}`\n"
+                f"　　{desglose} | 🎲 Total: `{tiradas}`"
             )
 
+        lines.append(f"\n🎲 Total de dados lanzados en el servidor: **{total_servidor}**")
         await message.channel.send("\n".join(lines))
 
 
