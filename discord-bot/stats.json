@@ -1,14 +1,14 @@
 {
-  "553675740646866944": {
-    "name": "Raboloko",
+  "381528867032268800": {
+    "name": "PissFish",
     "criticos": 0,
-    "pifias": 1,
+    "pifias": 0,
     "tiradas": 1,
     "dados": {
-      "d2": {
+      "d20": {
         "tiradas": 1,
         "criticos": 0,
-        "pifias": 1
+        "pifias": 0
       }
     }
   }
