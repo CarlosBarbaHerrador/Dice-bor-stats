@@ -141,15 +141,16 @@ class DiceBot(discord.Client):
         """Envía mensajes con protección contra Rate Limits."""
         try:
             await channel.send(content=content, embed=embed)
-            await asyncio.sleep(1.2) # Aumento de seguridad para evitar 429
+            # Pausa de 1.5s para ser muy conservadores con la API de Discord
+            await asyncio.sleep(1.5)
         except discord.errors.HTTPException as e:
             if e.status == 429: 
-                print("Rate limit (429) detectado. Pausando...")
-                await asyncio.sleep(5)
+                print("Rate limit detectado. Saltando mensaje para evitar baneo.")
 
     async def on_message(self, message: discord.Message):
         if message.author == self.user: return
-        if (datetime.now(timezone.utc) - message.created_at).total_seconds() > 60: return
+        # Ignorar mensajes de hace más de 30 segundos (evita spam al reconectar)
+        if (datetime.now(timezone.utc) - message.created_at).total_seconds() > 30: return
 
         if message.content.startswith("!marcador"):
             await self.cmd_marcador(message)
@@ -200,7 +201,7 @@ class DiceBot(discord.Client):
         text = message.content
         if message.embeds:
             for e in message.embeds:
-                text += f" {e.title} {e.description} "
+                text += f" {e.title or ''} {e.description or ''} "
                 for f in e.fields: text += f" {f.name} {f.value}"
         
         clean_text = re.sub(r"\*+", "", text)
@@ -238,27 +239,20 @@ class DiceBot(discord.Client):
             await message.channel.send("📊 No hay estadísticas.")
             return
 
-        for uid, data in self.stats.items():
-            if uid.isdigit() and message.guild:
-                mb = message.guild.get_member(int(uid))
-                if mb: data["name"] = mb.display_name
-
         sorted_players = sorted(self.stats.items(), key=lambda kv: kv[1].get("criticos", 0), reverse=True)
         lines = ["📊 **Marcador de dados**\n"]
         total_sv = 0
         for uid, data in sorted_players:
             name = f"<@{uid}>" if uid.isdigit() else f"**{data.get('name', uid)}**"
             total_sv += data.get("tiradas", 0)
-            
             ds = data.get("dados", {})
             desglose = " | ".join([f"{k}: {v['tiradas'] if isinstance(v,dict) else v}" for k, v in sorted(ds.items(), key=lambda x: int(x[0][1:]) if x[0][1:].isdigit() else 0)])
             lines.append(f"{name} — 🎯: `{data.get('criticos',0)}` | 💀: `{data.get('pifias',0)}` | 🎲 {desglose or 'n/a'} | **Total: {data.get('tiradas',0)}**")
         
-        lines.append(f"\nTotal del servidor: **{total_sv}** lanzado.")
         full_msg = "\n".join(lines)
         if len(full_msg) > 1900:
-            for i in range(0, len(lines), 10):
-                await self.safe_send(message.channel, "\n".join(lines[i:i+10]))
+            for i in range(0, len(lines), 5):
+                await self.safe_send(message.channel, "\n".join(lines[i:i+5]))
         else:
             await self.safe_send(message.channel, full_msg)
 
@@ -269,30 +263,23 @@ class DiceBot(discord.Client):
         for uid, data in players:
             embed = discord.Embed(title=f"📊 Estadísticas de {data.get('name', uid)}", color=0x7289da)
             embed.add_field(name="Global", value=f"🎯 Críticos: **{data.get('criticos',0)}**\n💀 Pifias: **{data.get('pifias',0)}**\n🎲 Total: **{data.get('tiradas',0)}**")
-            
             ds = data.get("dados", {})
             if ds:
                 txt = "\n".join([f"**{k}**: {v['tiradas']} tiradas | 🎯 {v['criticos']} | 💀 {v['pifias']}" for k, v in sorted(ds.items(), key=lambda x: int(x[0][1:]) if x[0][1:].isdigit() else 0) if (v['tiradas'] if isinstance(v,dict) else v) > 0])
                 if txt: embed.add_field(name="Desglose", value=txt, inline=False)
-            
             await self.safe_send(message.channel, content=f"<@{uid}>" if uid.isdigit() else None, embed=embed)
 
     async def cmd_set(self, message):
         if not message.guild or not message.author.guild_permissions.administrator: return
         parts = message.content.split()
-        if len(parts) != 4:
-            await message.channel.send("❌ Uso: `!set @user campo número` (Ej: `!set @paco d20_criticos 5`)")
-            return
-        
+        if len(parts) != 4: return
         _, m_raw, campo, val_raw = parts
         m_match = MENTION_IN_EMBED_PATTERN.search(m_raw)
         if not m_match: return
         uid = m_match.group(1)
         val = int(val_raw)
-        
         entry = get_or_create_entry(self.stats, uid, "Usuario")
         campo = campo.lower()
-        
         if campo in {"criticos", "pifias", "tiradas"}:
             entry[campo] = val
         else:
@@ -303,7 +290,6 @@ class DiceBot(discord.Client):
                 entry["tiradas"] = sum(v.get("tiradas",0) for v in entry["dados"].values())
                 entry["criticos"] = sum(v.get("criticos",0) for v in entry["dados"].values())
                 entry["pifias"] = sum(v.get("pifias",0) for v in entry["dados"].values())
-
         save_stats(self.stats)
         await message.channel.send(f"✅ Actualizado {campo} de <@{uid}> a {val}.")
 
@@ -311,47 +297,40 @@ class DiceBot(discord.Client):
         if not message.guild or not message.author.guild_permissions.administrator: return
         parts = message.content.split(maxsplit=1)
         target = parts[1].strip().lower() if len(parts) > 1 else None
-        
         removed = []
         for k in list(self.stats.keys()):
-            if not k.isdigit():
+            if not k.isdigit() or (target and self.stats[k].get("name", "").lower() == target):
                 removed.append(self.stats[k].get("name", k))
                 del self.stats[k]
-        
-        if target:
-            for k in list(self.stats.keys()):
-                if self.stats[k].get("name", "").lower() == target:
-                    removed.append(self.stats[k]["name"])
-                    del self.stats[k]
-        
         save_stats(self.stats)
         await message.channel.send(f"🗑️ Eliminados: {', '.join(removed) if removed else 'Nada'}")
 
-# --- INICIO ROBUSTO ---
+# --- INICIO ROBUSTO PARA RENDER ---
 async def main():
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         print("Error: No se encontró el TOKEN")
         return
     
-    keep_alive()
-    client = DiceBot()
+    keep_alive() # Servidor web para UptimeRobot
     
     while True:
+        client = DiceBot() # Creamos instancia limpia
         try:
-            # Reconnect=True maneja cortes leves de internet automáticamente
+            print("Iniciando conexión con Discord...")
             await client.start(token, reconnect=True)
-        except (discord.errors.HTTPException, discord.errors.GatewayNotFound) as e:
-            # Captura específicamente bloqueos de Cloudflare (1015) o Rate Limits
-            if getattr(e, 'status', None) in [429, 1015]:
-                print("Bloqueo de Discord/Cloudflare detectado. Pausando 5 minutos...")
-                await asyncio.sleep(300)
+        except (discord.errors.HTTPException, discord.errors.GatewayNotFound, Exception) as e:
+            status = getattr(e, 'status', None)
+            if status in [429, 1015]:
+                print(f"BLOQUEO CLOUDFLARE/RATE LIMIT ({status}). Esperando 5 minutos...")
+                await asyncio.sleep(305) # Esperar un poco más de los 5 min de baneo
             else:
-                print(f"Error de conexión, reintentando en 10s: {e}")
-                await asyncio.sleep(10)
-        except Exception as e:
-            print(f"Error inesperado, reiniciando en 10s: {e}")
-            await asyncio.sleep(10)
+                print(f"Error de conexión: {e}. Reintentando en 30s...")
+                await asyncio.sleep(30)
+        finally:
+            if not client.is_closed():
+                await client.close()
+            print("Sesión cerrada. Reiniciando bucle...")
 
 if __name__ == "__main__":
     try:
