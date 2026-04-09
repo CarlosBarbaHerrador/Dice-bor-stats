@@ -141,12 +141,13 @@ class DiceBot(discord.Client):
         """Envía mensajes con protección contra Rate Limits."""
         try:
             await channel.send(content=content, embed=embed)
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(1.2) # Aumento de seguridad para evitar 429
         except discord.errors.HTTPException as e:
-            if e.status == 429: print("Rate limit (429). Ignorando mensaje.")
+            if e.status == 429: 
+                print("Rate limit (429) detectado. Pausando...")
+                await asyncio.sleep(5)
 
     async def on_message(self, message: discord.Message):
-        # PROTECCIÓN: No responder a sí mismo ni a mensajes viejos (evita spam al conectar)
         if message.author == self.user: return
         if (datetime.now(timezone.utc) - message.created_at).total_seconds() > 60: return
 
@@ -163,7 +164,6 @@ class DiceBot(discord.Client):
             await self.cmd_remove(message)
             return
 
-        # Detección de Bots
         bot_name = message.author.name.lower()
         if "dice maiden" in bot_name or "dicemaiden" in bot_name:
             await self.handle_dice_maiden(message)
@@ -175,7 +175,6 @@ class DiceBot(discord.Client):
         if not roll_match: return
         caras, resultado = int(roll_match.group(2)), int(roll_match.group(3))
 
-        # Identificar jugador (Mención > Nombre > Historial)
         uid, name = None, "Desconocido"
         m = MENTION_IN_EMBED_PATTERN.search(message.content)
         if m: 
@@ -198,7 +197,6 @@ class DiceBot(discord.Client):
             if msg: await self.safe_send(message.channel, msg)
 
     async def handle_avrae(self, message: discord.Message):
-        # Unificamos contenido y embeds de Avrae
         text = message.content
         if message.embeds:
             for e in message.embeds:
@@ -214,7 +212,6 @@ class DiceBot(discord.Client):
             caras = int(roll_match.group(1) if "Result:" in clean_text else roll_match.group(2))
             res = int(roll_match.group(2) if "Result:" in clean_text else roll_match.group(3))
             
-            # Jugador
             uid = None
             m = MENTION_IN_EMBED_PATTERN.search(text)
             if m: uid = m.group(1)
@@ -236,13 +233,11 @@ class DiceBot(discord.Client):
                     else: await message.add_reaction("🎲")
                 except: pass
 
-    # --- COMANDOS DEL USUARIO ---
     async def cmd_marcador(self, message):
         if not self.stats:
             await message.channel.send("📊 No hay estadísticas.")
             return
 
-        # Actualizar nombres en tiempo real
         for uid, data in self.stats.items():
             if uid.isdigit() and message.guild:
                 mb = message.guild.get_member(int(uid))
@@ -255,13 +250,11 @@ class DiceBot(discord.Client):
             name = f"<@{uid}>" if uid.isdigit() else f"**{data.get('name', uid)}**"
             total_sv += data.get("tiradas", 0)
             
-            # Desglose de dados
             ds = data.get("dados", {})
             desglose = " | ".join([f"{k}: {v['tiradas'] if isinstance(v,dict) else v}" for k, v in sorted(ds.items(), key=lambda x: int(x[0][1:]) if x[0][1:].isdigit() else 0)])
             lines.append(f"{name} — 🎯: `{data.get('criticos',0)}` | 💀: `{data.get('pifias',0)}` | 🎲 {desglose or 'n/a'} | **Total: {data.get('tiradas',0)}**")
         
         lines.append(f"\nTotal del servidor: **{total_sv}** lanzado.")
-        # Dividir mensajes si son muy largos (Discord limita a 2000 carac.)
         full_msg = "\n".join(lines)
         if len(full_msg) > 1900:
             for i in range(0, len(lines), 10):
@@ -307,7 +300,6 @@ class DiceBot(discord.Client):
             if d_match:
                 d_key, sub = d_match.groups()
                 get_dado_sub(entry["dados"], d_key)[sub] = val
-                # Recalcular totales
                 entry["tiradas"] = sum(v.get("tiradas",0) for v in entry["dados"].values())
                 entry["criticos"] = sum(v.get("criticos",0) for v in entry["dados"].values())
                 entry["pifias"] = sum(v.get("pifias",0) for v in entry["dados"].values())
@@ -321,13 +313,11 @@ class DiceBot(discord.Client):
         target = parts[1].strip().lower() if len(parts) > 1 else None
         
         removed = []
-        # Limpieza automática de IDs no numéricos
         for k in list(self.stats.keys()):
             if not k.isdigit():
                 removed.append(self.stats[k].get("name", k))
                 del self.stats[k]
         
-        # Borrado por nombre si se pide
         if target:
             for k in list(self.stats.keys()):
                 if self.stats[k].get("name", "").lower() == target:
@@ -337,12 +327,34 @@ class DiceBot(discord.Client):
         save_stats(self.stats)
         await message.channel.send(f"🗑️ Eliminados: {', '.join(removed) if removed else 'Nada'}")
 
-# --- INICIO ---
-def main():
+# --- INICIO ROBUSTO ---
+async def main():
     token = os.environ.get("DISCORD_TOKEN")
-    if not token: return
+    if not token:
+        print("Error: No se encontró el TOKEN")
+        return
+    
     keep_alive()
-    DiceBot().run(token)
+    client = DiceBot()
+    
+    while True:
+        try:
+            # Reconnect=True maneja cortes leves de internet automáticamente
+            await client.start(token, reconnect=True)
+        except (discord.errors.HTTPException, discord.errors.GatewayNotFound) as e:
+            # Captura específicamente bloqueos de Cloudflare (1015) o Rate Limits
+            if getattr(e, 'status', None) in [429, 1015]:
+                print("Bloqueo de Discord/Cloudflare detectado. Pausando 5 minutos...")
+                await asyncio.sleep(300)
+            else:
+                print(f"Error de conexión, reintentando en 10s: {e}")
+                await asyncio.sleep(10)
+        except Exception as e:
+            print(f"Error inesperado, reiniciando en 10s: {e}")
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
