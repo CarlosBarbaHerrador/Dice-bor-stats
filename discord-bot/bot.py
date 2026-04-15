@@ -10,11 +10,13 @@ from keep_alive import keep_alive
 # --- CONFIGURACIÓN Y CONSTANTES ---
 STATS_FILE = Path(__file__).parent / "stats.json"
 MENTION_IN_EMBED_PATTERN = re.compile(r"<@!?(\d+)>")
-MARKDOWN_BOLD = re.compile(r"\*{1,2}")
+# CORRECCIÓN: Ahora solo limpia asteriscos, permitiendo barras bajas en nombres
+MARKDOWN_CLEANER = re.compile(r"\*+") 
 
 def strip_markdown(text: str) -> str:
-    """Elimina asteriscos de negrita/cursiva."""
-    return MARKDOWN_BOLD.sub("", text).strip()
+    """Elimina asteriscos pero conserva barras bajas para nombres de usuario."""
+    if not text: return ""
+    return MARKDOWN_CLEANER.sub("", text).strip()
 
 # --- GESTIÓN DE DATOS (JSON) ---
 def load_stats() -> dict:
@@ -112,7 +114,7 @@ def register_roll(stats: dict, uid: str, display_name: str, resultado: int, cara
 # --- UTILIDADES DE DISCORD ---
 async def find_command_invoker(channel, bot_message):
     try:
-        async for msg in channel.history(limit=5, before=bot_message):
+        async for msg in channel.history(limit=8, before=bot_message):
             if not msg.author.bot: return msg.author
     except: pass
     return None
@@ -140,7 +142,7 @@ class DiceBot(discord.Client):
     async def safe_send(self, channel, content=None, embed=None):
         try:
             await channel.send(content=content, embed=embed)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
         except discord.errors.HTTPException as e:
             if e.status == 429: print("Rate limit detectado.")
 
@@ -148,6 +150,7 @@ class DiceBot(discord.Client):
         if message.author == self.user: return
         if (datetime.now(timezone.utc) - message.created_at).total_seconds() > 30: return
 
+        content = message.content
         if message.content.startswith("!marcador"):
             await self.cmd_marcador(message)
             return
@@ -168,24 +171,32 @@ class DiceBot(discord.Client):
             await self.handle_avrae(message)
 
     async def handle_dice_maiden(self, message: discord.Message):
+        # Regex mejorado para detectar resultados incluso sin la palabra "Request"
         roll_match = re.search(r"(\d+)d(\d+).*?Roll:.*?\[(\d+)\]", message.content, re.IGNORECASE | re.DOTALL)
         if not roll_match: return
+        
         caras, resultado = int(roll_match.group(2)), int(roll_match.group(3))
         uid, name = None, "Desconocido"
+        
+        # 1. Intentar por mención
         m = MENTION_IN_EMBED_PATTERN.search(message.content)
         if m: 
             uid = m.group(1)
             member = message.guild.get_member(int(uid))
             name = member.display_name if member else f"Usuario {uid}"
         else:
-            nm = re.search(r"🎲\s*(.*?)\s+Request\b", message.content, re.IGNORECASE)
+            # 2. Intentar extraer nombre del formato de Dice Maiden (con o sin Request)
+            nm = re.search(r"🎲\s*(.*?)\s+(?:Request|ha utilizado|roll)\b", message.content, re.IGNORECASE)
             if nm:
                 ext = strip_markdown(nm.group(1).strip())
                 mb = resolve_member_by_name(message.guild, ext)
-                uid, name = (str(mb.id), mb.display_name) if mb else (ext.lower().replace(" ","_"), ext)
-        if not uid:
+                uid, name = (str(mb.id), mb.display_name) if mb else (ext, ext)
+        
+        # 3. Backup: Buscar quién escribió antes
+        if not uid or uid == "Desconocido":
             invoker = await find_command_invoker(message.channel, message)
             if invoker: uid, name = str(invoker.id), invoker.display_name
+            
         if uid:
             msg = register_roll(self.stats, uid, name, resultado, caras)
             if msg: await self.safe_send(message.channel, msg)
@@ -196,19 +207,24 @@ class DiceBot(discord.Client):
             for e in message.embeds:
                 text += f" {e.title or ''} {e.description or ''} "
                 for f in e.fields: text += f" {f.name} {f.value}"
-        clean_text = re.sub(r"\*+", "", text)
+        
+        # Limpieza suave (solo asteriscos)
+        clean_text = strip_markdown(text)
         roll_match = re.search(r"Result:.*?\d+d(\d+)\s*\((\d+)\)", clean_text, re.IGNORECASE)
         if not roll_match:
             roll_match = re.search(r"(\d+)d(\d+)[^()\n]*\((\d+)\)", clean_text, re.IGNORECASE)
+            
         if roll_match:
             caras = int(roll_match.group(1) if "Result:" in clean_text else roll_match.group(2))
             res = int(roll_match.group(2) if "Result:" in clean_text else roll_match.group(3))
             uid = None
+            
             m = MENTION_IN_EMBED_PATTERN.search(text)
             if m: uid = m.group(1)
             else:
                 inv = await find_command_invoker(message.channel, message)
                 if inv: uid = str(inv.id)
+                
             if uid:
                 mb = message.guild.get_member(int(uid))
                 name = mb.display_name if mb else f"Usuario {uid}"
@@ -223,6 +239,7 @@ class DiceBot(discord.Client):
                     else: await message.add_reaction("🎲")
                 except: pass
 
+    # --- COMANDOS (SE MANTIENEN IGUAL) ---
     async def cmd_marcador(self, message):
         if not self.stats:
             await message.channel.send("📊 No hay estadísticas.")
@@ -285,20 +302,17 @@ class DiceBot(discord.Client):
         save_stats(self.stats)
         await message.channel.send(f"🗑️ Eliminados: {', '.join(removed) if removed else 'Nada'}")
 
-# --- ARRANQUE COMPATIBLE CON RENDER ---
+# --- ARRANQUE ---
 async def main():
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         print("Error: TOKEN no encontrado.")
         return
-    
-    # IMPORTANTE: keep_alive() debe ejecutarse ANTES de entrar al bucle de Discord
     keep_alive()
-    
     while True:
         client = DiceBot()
         try:
-            print("Iniciando conexión con Discord...")
+            print("Iniciando conexión...")
             await client.start(token, reconnect=True)
         except Exception as e:
             print(f"Error: {e}. Reintentando en 30s...")
@@ -310,4 +324,3 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt: pass
-        
