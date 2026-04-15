@@ -8,9 +8,7 @@ from pathlib import Path
 from keep_alive import keep_alive
 
 # --- CONFIGURACIÓN Y CONSTANTES ---
-# Usamos una ruta absoluta para asegurar que el archivo se guarde siempre en el mismo sitio
-BASE_DIR = Path(__file__).parent
-STATS_FILE = BASE_DIR / "stats.json"
+STATS_FILE = Path(__file__).parent / "stats.json"
 MENTION_IN_EMBED_PATTERN = re.compile(r"<@!?(\d+)>")
 MARKDOWN_BOLD = re.compile(r"\*+")
 
@@ -21,35 +19,28 @@ def strip_markdown(text: str) -> str:
 
 # --- GESTIÓN DE DATOS (JSON) ---
 def load_stats() -> dict:
-    """Carga los datos del JSON de forma segura."""
     if STATS_FILE.exists():
         try:
             with open(STATS_FILE, "r", encoding="utf-8") as f:
-                content = f.read()
-                if not content: return {}
-                return json.loads(content)
+                return json.load(f)
         except Exception as e:
             print(f"Error cargando archivo: {e}")
             return {}
     return {}
 
 def save_stats(stats: dict) -> None:
-    """Guarda los datos asegurando persistencia."""
     try:
-        # Guardar en un archivo temporal primero para evitar corrupción si el bot se apaga a mitad
-        temp_file = STATS_FILE.with_suffix(".tmp")
-        with open(temp_file, "w", encoding="utf-8") as f:
+        with open(STATS_FILE, "w", encoding="utf-8") as f:
             json.dump(stats, f, ensure_ascii=False, indent=2)
-        # Reemplazar el archivo original con el temporal
-        temp_file.replace(STATS_FILE)
     except Exception as e:
-        print(f"Error crítico guardando archivo: {e}")
+        print(f"Error guardando archivo: {e}")
 
 # --- LÓGICA DE ESTADÍSTICAS ---
 def get_dado_sub(dados: dict, dado_key: str) -> dict:
     val = dados.get(dado_key)
     if not isinstance(val, dict):
-        dados[dado_key] = {"tiradas": val if isinstance(val, int) else 0, "criticos": 0, "pifias": 0}
+        # Si el dato es corrupto (ej: un número suelto), lo reseteamos a un diccionario válido
+        dados[dado_key] = {"tiradas": 0, "criticos": 0, "pifias": 0}
     return dados[dado_key]
 
 def merge_entry(target: dict, source: dict) -> None:
@@ -100,7 +91,8 @@ def get_or_create_entry(stats: dict, uid: str, display_name: str) -> dict:
     else:
         entry = stats[uid]
         entry["name"] = clean_name
-        entry.setdefault("dados", {})
+        # Aseguramos que 'dados' sea un diccionario
+        if "dados" not in entry or not isinstance(entry["dados"], dict): entry["dados"] = {}
     return stats[uid]
 
 def register_roll(stats: dict, uid: str, display_name: str, resultado: int, caras: int) -> str | None:
@@ -110,16 +102,15 @@ def register_roll(stats: dict, uid: str, display_name: str, resultado: int, cara
     dado_sub = get_dado_sub(entry["dados"], dado_key)
     dado_sub["tiradas"] += 1
 
-    msg = None
     if resultado == caras:
-        entry["criticos"] += 1; dado_sub["criticos"] += 1
-        msg = f"🎯 **¡CRÍTICO!** {entry['name']} sacó {resultado} en un d{caras}!"
-    elif resultado == 1:
-        entry["pifias"] += 1; dado_sub["pifias"] += 1
-        msg = f"💀 **¡PIFIA!** {entry['name']} sacó 1 en un d{caras}!"
+        entry["criticos"] += 1; dado_sub["criticos"] += 1; save_stats(stats)
+        return f"🎯 **¡CRÍTICO!** {entry['name']} sacó {resultado} en un d{caras}!"
+    if resultado == 1:
+        entry["pifias"] += 1; dado_sub["pifias"] += 1; save_stats(stats)
+        return f"💀 **¡PIFIA!** {entry['name']} sacó 1 en un d{caras}!"
     
     save_stats(stats)
-    return msg
+    return None
 
 # --- UTILIDADES DE DISCORD ---
 async def find_command_invoker(channel, bot_message):
@@ -152,13 +143,14 @@ class DiceBot(discord.Client):
     async def safe_send(self, channel, content=None, embed=None):
         try:
             await channel.send(content=content, embed=embed)
-        except Exception as e:
-            print(f"Error enviando mensaje: {e}")
+            await asyncio.sleep(1.5)
+        except discord.errors.HTTPException as e:
+            if e.status == 429: print("Rate limit detectado.")
 
     async def on_message(self, message: discord.Message):
         if message.author == self.user: return
-        
-        # Comandos
+        if (datetime.now(timezone.utc) - message.created_at).total_seconds() > 30: return
+
         if message.content.startswith("!marcador"):
             await self.cmd_marcador(message)
             return
@@ -172,7 +164,6 @@ class DiceBot(discord.Client):
             await self.cmd_remove(message)
             return
 
-        # Detección de bots de dados
         bot_name = message.author.name.lower()
         if "dice maiden" in bot_name or "dicemaiden" in bot_name or "dado" in bot_name:
             await self.handle_dice_maiden(message)
@@ -180,13 +171,10 @@ class DiceBot(discord.Client):
             await self.handle_avrae(message)
 
     async def handle_dice_maiden(self, message: discord.Message):
-        # Reconoce "d2" y "1d2"
         roll_match = re.search(r"(\d*)d(\d+).*?Roll:.*?\[(\d+)\]", message.content, re.IGNORECASE | re.DOTALL)
         if not roll_match: return
-        
         caras, resultado = int(roll_match.group(2)), int(roll_match.group(3))
         uid, name = None, "Desconocido"
-        
         m = MENTION_IN_EMBED_PATTERN.search(message.content)
         if m: 
             uid = m.group(1)
@@ -213,89 +201,153 @@ class DiceBot(discord.Client):
             for e in message.embeds:
                 text += f" {e.title or ''} {e.description or ''} "
                 for f in e.fields: text += f" {f.name} {f.value}"
-        
-        clean_text = strip_markdown(text)
-        roll_match = re.search(r"(\d*)d(\d+).*?\((\d+)\)", clean_text, re.IGNORECASE)
-        
+        clean_text = re.sub(r"\*+", "", text)
+        roll_match = re.search(r"Result:.*?(\d*)d(\d+)\s*\((\d+)\)", clean_text, re.IGNORECASE)
+        if not roll_match:
+            roll_match = re.search(r"(\d*)d(\d+)[^()\n]*\((\d+)\)", clean_text, re.IGNORECASE)
         if roll_match:
-            caras, res = int(roll_match.group(2) or 1), int(roll_match.group(3))
-            inv = await find_command_invoker(message.channel, message)
-            if inv:
-                msg = register_roll(self.stats, str(inv.id), inv.display_name, res, caras)
-                if msg: await self.safe_send(message.channel, msg)
+            caras = int(roll_match.group(2))
+            res = int(roll_match.group(3))
+            uid = None
+            m = MENTION_IN_EMBED_PATTERN.search(text)
+            if m: uid = m.group(1)
+            else:
+                inv = await find_command_invoker(message.channel, message)
+                if inv: uid = str(inv.id)
+            if uid:
+                mb = message.guild.get_member(int(uid))
+                name = mb.display_name if mb else f"Usuario {uid}"
+                msg = register_roll(self.stats, uid, name, res, caras)
+                try:
+                    if res == caras: 
+                        await message.add_reaction("🎯")
+                        if msg: await self.safe_send(message.channel, msg)
+                    elif res == 1: 
+                        await message.add_reaction("💀")
+                        if msg: await self.safe_send(message.channel, msg)
+                    else: await message.add_reaction("🎲")
+                except: pass
 
+    # --- ARREGLO DEFINITIVO DE cmd_marcador ---
     async def cmd_marcador(self, message):
         if not self.stats:
-            return await message.channel.send("📊 No hay estadísticas guardadas aún.")
-        
+            await message.channel.send("📊 No hay estadísticas.")
+            return
+
+        # Ordenar por críticos (descendente)
         sorted_players = sorted(self.stats.items(), key=lambda kv: kv[1].get("criticos", 0), reverse=True)
         lines = ["📊 **Marcador de dados**\n"]
+
         for uid, data in sorted_players:
-            mention = f"<@{uid}>" if uid.isdigit() else f"**{data.get('name', uid)}**"
-            lines.append(f"{mention} — 🎯: `{data.get('criticos',0)}` | 💀: `{data.get('pifias',0)}` | **Total: {data.get('tiradas',0)}**")
-        
-        await message.channel.send("\n".join(lines))
+            # 1. Identificar al usuario (mención o nombre en negrita)
+            name_display = f"<@{uid}>" if uid.isdigit() else f"**{data.get('name', uid)}**"
+            
+            # 2. Resumen global
+            lines.append(f"{name_display} — 🎯: `{data.get('criticos',0)}` | 💀: `{data.get('pifias',0)}` | **Total: {data.get('tiradas',0)}**")
+
+            # 3. Desglose detallado de dados
+            dados_dict = data.get("dados", {})
+            if isinstance(dados_dict, dict) and dados_dict:
+                # Ordenar los dados (d2, d6, d20...) numéricamente
+                try:
+                    sorted_dados = sorted(
+                        dados_dict.items(),
+                        key=lambda x: int(re.sub(r"\D", "", x[0])) if re.sub(r"\D", "", x[0]).isdigit() else 0
+                    )
+                except:
+                    sorted_dados = dados_dict.items() # Fallback si falla el ordenamiento
+
+                desglose_parts = []
+                for dado_key, dado_val in sorted_dados:
+                    # Asegurar que el valor sea un diccionario (anti-corrupción)
+                    if isinstance(dado_val, dict):
+                        tiradas = dado_val.get("tiradas", 0)
+                        if tiradas > 0:
+                            desglose_parts.append(f"{dado_key}: {tiradas}")
+                    elif isinstance(dado_val, int):
+                        # Caso backup por si quedó algún dato viejo en formato int
+                        if dado_val > 0: desglose_parts.append(f"{dado_key}: {dado_val}")
+
+                if desglose_parts:
+                    lines.append(f"> 🎲 Desglose: " + " | ".join(desglose_parts))
+            
+            # Línea en blanco para separar jugadores
+            lines.append("")
+
+        # Envío seguro (anti-límite de 2000 caracteres)
+        full_msg = "\n".join(lines)
+        if len(full_msg) > 1900:
+            for i in range(0, len(lines), 5): await self.safe_send(message.channel, "\n".join(lines[i:i+5]))
+        else: await self.safe_send(message.channel, full_msg)
 
     async def cmd_estadisticas(self, message):
         m = MENTION_IN_EMBED_PATTERN.search(message.content)
-        uid = m.group(1) if m else str(message.author.id)
-        if uid not in self.stats:
-            return await message.channel.send("No tengo datos de ese usuario.")
-        
-        data = self.stats[uid]
-        embed = discord.Embed(title=f"Estadísticas de {data.get('name', uid)}", color=0x7289da)
-        embed.add_field(name="Resumen", value=f"🎯 Críticos: {data.get('criticos')}\n💀 Pifias: {data.get('pifias')}\nTotal: {data.get('tiradas')}")
-        await message.channel.send(embed=embed)
+        players = [(m.group(1), self.stats[m.group(1)])] if m and m.group(1) in self.stats else sorted(self.stats.items(), key=lambda x: x[1].get("criticos",0), reverse=True)
+        for uid, data in players:
+            embed = discord.Embed(title=f"📊 Estadísticas de {data.get('name', uid)}", color=0x7289da)
+            embed.add_field(name="Global", value=f"🎯 Críticos: **{data.get('criticos',0)}**\n💀 Pifias: **{data.get('pifias',0)}**\n🎲 Total: **{data.get('tiradas',0)}**")
+            
+            # Desglose en estadísticas individuales
+            ds = data.get("dados", {})
+            if isinstance(ds, dict) and ds:
+                txt = "\n".join([f"**{k}**: {v['tiradas']} tiradas | 🎯 {v['criticos']} | 💀 {v['pifias']}" for k, v in sorted(ds.items(), key=lambda x: int(re.sub(r'\D','',x[0])) if re.sub(r'\D','',x[0]).isdigit() else 0) if isinstance(v,dict) and v['tiradas'] > 0])
+                if txt: embed.add_field(name="Desglose por dado", value=txt, inline=False)
+            
+            await self.safe_send(message.channel, content=f"<@{uid}>" if uid.isdigit() else None, embed=embed)
 
     async def cmd_set(self, message):
-        if not message.author.guild_permissions.administrator: return
-        try:
-            p = message.content.split()
-            m = MENTION_IN_EMBED_PATTERN.search(p[1])
-            uid, campo, val = m.group(1), p[2].lower(), int(p[3])
-            entry = get_or_create_entry(self.stats, uid, "Usuario")
-            
-            if "_" in campo:
-                dk, sub = campo.split("_")
+        if not message.guild or not message.author.guild_permissions.administrator: return
+        parts = message.content.split()
+        if len(parts) != 4: return
+        _, m_raw, campo, val_raw = parts
+        m_match = MENTION_IN_EMBED_PATTERN.search(m_raw)
+        if not m_match: return
+        uid, val = m_match.group(1), int(val_raw)
+        entry = get_or_create_entry(self.stats, uid, "Usuario")
+        campo = campo.lower()
+        if campo in {"criticos", "pifias", "tiradas"}: entry[campo] = val
+        else:
+            d_match = re.match(r"^(d\d+)_(criticos|pifias|tiradas)$", campo)
+            if d_match:
+                dk, sub = d_match.groups()
                 get_dado_sub(entry["dados"], dk)[sub] = val
-                # Recalcular totales
-                entry["criticos"] = sum(v.get("criticos", 0) for v in entry["dados"].values() if isinstance(v, dict))
-                entry["pifias"] = sum(v.get("pifias", 0) for v in entry["dados"].values() if isinstance(v, dict))
-                entry["tiradas"] = sum(v.get("tiradas", 0) for v in entry["dados"].values() if isinstance(v, dict))
-            else:
-                entry[campo] = val
-            
-            save_stats(self.stats)
-            await message.channel.send(f"✅ {campo} actualizado.")
-        except:
-            await message.channel.send("❌ Uso: `!set @user campo valor` (Ej: `d20_criticos 10`)")
+                entry["tiradas"] = sum(v.get("tiradas",0) for v in entry["dados"].values() if isinstance(v,dict))
+                entry["criticos"] = sum(v.get("criticos",0) for v in entry["dados"].values() if isinstance(v,dict))
+                entry["pifias"] = sum(v.get("pifias",0) for v in entry["dados"].values() if isinstance(v,dict))
+        save_stats(self.stats)
+        await message.channel.send(f"✅ Actualizado {campo} de <@{uid}> a {val}.")
 
     async def cmd_remove(self, message):
-        if not message.author.guild_permissions.administrator: return
+        if not message.guild or not message.author.guild_permissions.administrator: return
         parts = message.content.split(maxsplit=1)
-        if len(parts) < 2: return
-        target = parts[1].strip()
-        
-        m = MENTION_IN_EMBED_PATTERN.search(target)
-        uid_to_del = m.group(1) if m else None
-        
-        if uid_to_del in self.stats:
-            del self.stats[uid_to_del]
-            save_stats(self.stats)
-            await message.channel.send(f"🗑️ Usuario eliminado.")
+        target = parts[1].strip().lower() if len(parts) > 1 else None
+        removed = []
+        for k in list(self.stats.keys()):
+            if not k.isdigit() or (target and self.stats[k].get("name", "").lower() == target):
+                removed.append(self.stats[k].get("name", k))
+                del self.stats[k]
+        save_stats(self.stats)
+        await message.channel.send(f"🗑️ Eliminados: {', '.join(removed) if removed else 'Nada'}")
 
 # --- ARRANQUE ---
 async def main():
     token = os.environ.get("DISCORD_TOKEN")
-    if not token: return print("Falta el TOKEN.")
+    if not token:
+        print("Error: TOKEN no encontrado.")
+        return
     keep_alive()
     while True:
         client = DiceBot()
         try:
-            await client.start(token)
+            print("Iniciando conexión con Discord...")
+            await client.start(token, reconnect=True)
         except Exception as e:
-            print(f"Reconectando... {e}")
-            await asyncio.sleep(10)
+            print(f"Error: {e}. Reintentando en 30s...")
+            await asyncio.sleep(30)
+        finally:
+            if not client.is_closed(): await client.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt: pass
