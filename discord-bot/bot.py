@@ -16,6 +16,7 @@ db = cluster["DB-DICE"]
 collection = db["stats"]
 
 # --- CONFIGURACIÓN Y CONSTANTES ---
+# Localizamos el archivo stats.json en la misma carpeta que este script
 STATS_FILE = Path(__file__).parent / "stats.json"
 MENTION_IN_EMBED_PATTERN = re.compile(r"<@!?(\d+)>")
 MARKDOWN_BOLD = re.compile(r"\*+")
@@ -25,25 +26,42 @@ def strip_markdown(text: str) -> str:
     if not text: return ""
     return MARKDOWN_BOLD.sub("", text).strip()
 
-# --- GESTIÓN DE DATOS (NUBE MongoDB) ---
+# --- GESTIÓN DE DATOS (MIGRACIÓN Y NUBE) ---
 def load_stats() -> dict:
-    """Carga los datos desde MongoDB en lugar del archivo JSON local."""
+    """Carga datos de MongoDB. Si está vacío, migra desde el JSON local."""
     try:
+        # Intentamos buscar el documento global en MongoDB
         data = collection.find_one({"_id": "global_stats"})
+        
         if data:
+            print("✅ Datos cargados con éxito desde MongoDB Atlas.")
             stats = dict(data)
-            del stats["_id"] # Limpiamos el ID de Mongo
+            del stats["_id"] 
             return stats
+        
+        # Si no existe en MongoDB, intentamos migrar desde el JSON local
+        print("⚠️ No hay datos en MongoDB. Buscando stats.json local para migración...")
+        if STATS_FILE.exists():
+            with open(STATS_FILE, "r", encoding="utf-8") as f:
+                local_data = json.load(f)
+            
+            if local_data:
+                print(f"🚀 Migración iniciada: Subiendo {len(local_data)} entradas a la nube...")
+                save_stats(local_data)
+                return local_data
+        else:
+            print("ℹ️ No se detectó archivo local ni datos en la nube. Iniciando base de datos vacía.")
+            
     except Exception as e:
-        print(f"Error cargando desde MongoDB: {e}")
+        print(f"❌ Error crítico en la carga/migración: {e}")
     return {}
 
 def save_stats(stats: dict) -> None:
-    """Guarda los datos en MongoDB para persistencia real en Render."""
+    """Guarda los datos en MongoDB usando el ID global."""
     try:
         collection.replace_one({"_id": "global_stats"}, stats, upsert=True)
     except Exception as e:
-        print(f"Error guardando en MongoDB: {e}")
+        print(f"❌ Error guardando en MongoDB: {e}")
 
 # --- LÓGICA DE ESTADÍSTICAS ---
 def get_dado_sub(dados: dict, dado_key: str) -> dict:
@@ -67,6 +85,7 @@ def merge_entry(target: dict, source: dict) -> None:
             t["pifias"] += dado_val.get("pifias", 0)
 
 def migrate_stats(stats: dict) -> dict:
+    """Limpia nombres y asegura que la estructura interna sea correcta."""
     changed = False
     new_stats: dict = {}
     for key, data in stats.items():
@@ -110,15 +129,18 @@ def register_roll(stats: dict, uid: str, display_name: str, resultado: int, cara
     dado_sub = get_dado_sub(entry["dados"], dado_key)
     dado_sub["tiradas"] += 1
 
+    msg = None
     if resultado == caras:
-        entry["criticos"] += 1; dado_sub["criticos"] += 1; save_stats(stats)
-        return f"🎯 **¡CRÍTICO!** {entry['name']} sacó {resultado} en un d{caras}!"
-    if resultado == 1:
-        entry["pifias"] += 1; dado_sub["pifias"] += 1; save_stats(stats)
-        return f"💀 **¡PIFIA!** {entry['name']} sacó 1 en un d{caras}!"
+        entry["criticos"] += 1
+        dado_sub["criticos"] += 1
+        msg = f"🎯 **¡CRÍTICO!** {entry['name']} sacó {resultado} en un d{caras}!"
+    elif resultado == 1:
+        entry["pifias"] += 1
+        dado_sub["pifias"] += 1
+        msg = f"💀 **¡PIFIA!** {entry['name']} sacó 1 en un d{caras}!"
     
     save_stats(stats)
-    return None
+    return msg
 
 # --- UTILIDADES DE DISCORD ---
 async def find_command_invoker(channel, bot_message):
@@ -144,36 +166,35 @@ class DiceBot(discord.Client):
         self.stats = {}
 
     async def on_ready(self):
-        print(f"Conectado como {self.user}")
+        print(f"🤖 Bot conectado como {self.user}")
+        # Al iniciar, cargamos y migramos si es necesario
         self.stats = load_stats()
-        migrate_stats(self.stats)
+        self.stats = migrate_stats(self.stats)
 
     async def safe_send(self, channel, content=None, embed=None):
         try:
             await channel.send(content=content, embed=embed)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(0.5)
         except discord.errors.HTTPException as e:
-            if e.status == 429: print("Rate limit detectado.")
+            if e.status == 429: print("⚠️ Rate limit detectado.")
 
     async def on_message(self, message: discord.Message):
         if message.author == self.user: return
         if (datetime.now(timezone.utc) - message.created_at).total_seconds() > 30: return
 
-        if message.content.startswith("!marcador"):
+        content = message.content.lower()
+        if content.startswith("!marcador"):
             await self.cmd_marcador(message)
-            return
-        if message.content.startswith("!estadisticas"):
+        elif content.startswith("!estadisticas"):
             await self.cmd_estadisticas(message)
-            return
-        if message.content.startswith("!set"):
+        elif content.startswith("!set"):
             await self.cmd_set(message)
-            return
-        if message.content.startswith("!remove"):
+        elif content.startswith("!remove"):
             await self.cmd_remove(message)
-            return
 
+        # Escuchar a otros bots de dados
         bot_name = message.author.name.lower()
-        if "dice maiden" in bot_name or "dicemaiden" in bot_name or "dado" in bot_name:
+        if any(x in bot_name for x in ["dice maiden", "dicemaiden", "dado"]):
             await self.handle_dice_maiden(message)
         elif "avrae" in bot_name:
             await self.handle_avrae(message)
@@ -183,6 +204,7 @@ class DiceBot(discord.Client):
         if not roll_match: return
         caras, resultado = int(roll_match.group(2)), int(roll_match.group(3))
         uid, name = None, "Desconocido"
+        
         m = MENTION_IN_EMBED_PATTERN.search(message.content)
         if m: 
             uid = m.group(1)
@@ -213,6 +235,7 @@ class DiceBot(discord.Client):
         roll_match = re.search(r"Result:.*?(\d*)d(\d+)\s*\((\d+)\)", clean_text, re.IGNORECASE)
         if not roll_match:
             roll_match = re.search(r"(\d*)d(\d+)[^()\n]*\((\d+)\)", clean_text, re.IGNORECASE)
+        
         if roll_match:
             caras = int(roll_match.group(2))
             res = int(roll_match.group(3))
@@ -222,6 +245,7 @@ class DiceBot(discord.Client):
             else:
                 inv = await find_command_invoker(message.channel, message)
                 if inv: uid = str(inv.id)
+            
             if uid:
                 mb = message.guild.get_member(int(uid))
                 name = mb.display_name if mb else f"Usuario {uid}"
@@ -238,7 +262,7 @@ class DiceBot(discord.Client):
 
     async def cmd_marcador(self, message):
         if not self.stats:
-            await message.channel.send("📊 No hay estadísticas.")
+            await message.channel.send("📊 No hay estadísticas registradas.")
             return
 
         sorted_players = sorted(self.stats.items(), key=lambda kv: kv[1].get("criticos", 0), reverse=True)
@@ -250,35 +274,32 @@ class DiceBot(discord.Client):
 
             dados_dict = data.get("dados", {})
             if isinstance(dados_dict, dict) and dados_dict:
-                try:
-                    sorted_dados = sorted(
-                        dados_dict.items(),
-                        key=lambda x: int(re.sub(r"\D", "", x[0])) if re.sub(r"\D", "", x[0]).isdigit() else 0
-                    )
-                except:
-                    sorted_dados = dados_dict.items()
-
                 desglose_parts = []
-                for dado_key, dado_val in sorted_dados:
-                    if isinstance(dado_val, dict):
-                        tiradas = dado_val.get("tiradas", 0)
-                        if tiradas > 0:
-                            desglose_parts.append(f"{dado_key}: {tiradas}")
-                    elif isinstance(dado_val, int):
-                        if dado_val > 0: desglose_parts.append(f"{dado_key}: {dado_val}")
-
+                for dk in sorted(dados_dict.keys(), key=lambda x: int(re.sub(r'\D','',x)) if re.sub(r'\D','',x).isdigit() else 0):
+                    dv = dados_dict[dk]
+                    tiradas = dv.get("tiradas", 0) if isinstance(dv, dict) else dv
+                    if tiradas > 0: desglose_parts.append(f"{dk}: {tiradas}")
+                
                 if desglose_parts:
                     lines.append(f"> 🎲 Desglose: " + " | ".join(desglose_parts))
             lines.append("")
 
         full_msg = "\n".join(lines)
         if len(full_msg) > 1900:
-            for i in range(0, len(lines), 5): await self.safe_send(message.channel, "\n".join(lines[i:i+5]))
-        else: await self.safe_send(message.channel, full_msg)
+            # Dividir en varios mensajes si es muy largo
+            for i in range(0, len(lines), 10):
+                chunk = "\n".join(lines[i:i+10])
+                if chunk: await self.safe_send(message.channel, chunk)
+        else:
+            await self.safe_send(message.channel, full_msg)
 
     async def cmd_estadisticas(self, message):
         m = MENTION_IN_EMBED_PATTERN.search(message.content)
-        players = [(m.group(1), self.stats[m.group(1)])] if m and m.group(1) in self.stats else sorted(self.stats.items(), key=lambda x: x[1].get("criticos",0), reverse=True)
+        if m and m.group(1) in self.stats:
+            players = [(m.group(1), self.stats[m.group(1)])]
+        else:
+            players = sorted(self.stats.items(), key=lambda x: x[1].get("criticos",0), reverse=True)
+        
         for uid, data in players:
             embed = discord.Embed(title=f"📊 Estadísticas de {data.get('name', uid)}", color=0x7289da)
             embed.add_field(name="Global", value=f"🎯 Críticos: **{data.get('criticos',0)}**\n💀 Pifias: **{data.get('pifias',0)}**\n🎲 Total: **{data.get('tiradas',0)}**")
@@ -328,16 +349,19 @@ class DiceBot(discord.Client):
 async def main():
     token = os.environ.get("DISCORD_TOKEN")
     if not token or not MONGO_URI:
-        print("Error: TOKEN o MONGO_URI no encontrado.")
+        print("❌ Error: TOKEN o MONGO_URI no encontrado en las variables de entorno.")
         return
+    
+    # Mantiene el bot despierto en Render
     keep_alive()
+
     while True:
         client = DiceBot()
         try:
-            print("Iniciando conexión con Discord...")
+            print("🚀 Iniciando conexión con Discord...")
             await client.start(token, reconnect=True)
         except Exception as e:
-            print(f"Error: {e}. Reintentando en 30s...")
+            print(f"❌ Error de conexión: {e}. Reintentando en 30s...")
             await asyncio.sleep(30)
         finally:
             if not client.is_closed(): await client.close()
@@ -345,4 +369,5 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt: pass
+    except KeyboardInterrupt:
+        pass
