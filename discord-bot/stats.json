@@ -11,5 +11,18 @@
         "pifias": 0
       }
     }
+  },
+  "553675740646866944": {
+    "name": "SaveMeMahoragaChan",
+    "criticos": 3,
+    "pifias": 1,
+    "tiradas": 7,
+    "dados": {
+      "d5": { "tiradas": 1, "criticos": 1, "pifias": 0 },
+      "d10": { "tiradas": 1, "criticos": 0, "pifias": 0 },
+      "d20": { "tiradas": 2, "criticos": 2, "pifias": 0 },
+      "d30": { "tiradas": 2, "criticos": 0, "pifias": 0 },
+      "d40": { "tiradas": 1, "criticos": 0, "pifias": 1 }
+    }
   }
 }
