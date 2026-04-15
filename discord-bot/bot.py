@@ -3,9 +3,17 @@ import re
 import json
 import os
 import asyncio
+import pymongo
+from pymongo import MongoClient
 from datetime import datetime, timezone
 from pathlib import Path
 from keep_alive import keep_alive
+
+# --- CONFIGURACIÓN DE BASE DE DATOS (MongoDB) ---
+MONGO_URI = os.environ.get("MONGO_URI")
+cluster = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+db = cluster["DB-DICE"]
+collection = db["stats"]
 
 # --- CONFIGURACIÓN Y CONSTANTES ---
 STATS_FILE = Path(__file__).parent / "stats.json"
@@ -17,29 +25,30 @@ def strip_markdown(text: str) -> str:
     if not text: return ""
     return MARKDOWN_BOLD.sub("", text).strip()
 
-# --- GESTIÓN DE DATOS (JSON) ---
+# --- GESTIÓN DE DATOS (NUBE MongoDB) ---
 def load_stats() -> dict:
-    if STATS_FILE.exists():
-        try:
-            with open(STATS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Error cargando archivo: {e}")
-            return {}
+    """Carga los datos desde MongoDB en lugar del archivo JSON local."""
+    try:
+        data = collection.find_one({"_id": "global_stats"})
+        if data:
+            stats = dict(data)
+            del stats["_id"] # Limpiamos el ID de Mongo
+            return stats
+    except Exception as e:
+        print(f"Error cargando desde MongoDB: {e}")
     return {}
 
 def save_stats(stats: dict) -> None:
+    """Guarda los datos en MongoDB para persistencia real en Render."""
     try:
-        with open(STATS_FILE, "w", encoding="utf-8") as f:
-            json.dump(stats, f, ensure_ascii=False, indent=2)
+        collection.replace_one({"_id": "global_stats"}, stats, upsert=True)
     except Exception as e:
-        print(f"Error guardando archivo: {e}")
+        print(f"Error guardando en MongoDB: {e}")
 
 # --- LÓGICA DE ESTADÍSTICAS ---
 def get_dado_sub(dados: dict, dado_key: str) -> dict:
     val = dados.get(dado_key)
     if not isinstance(val, dict):
-        # Si el dato es corrupto (ej: un número suelto), lo reseteamos a un diccionario válido
         dados[dado_key] = {"tiradas": 0, "criticos": 0, "pifias": 0}
     return dados[dado_key]
 
@@ -91,7 +100,6 @@ def get_or_create_entry(stats: dict, uid: str, display_name: str) -> dict:
     else:
         entry = stats[uid]
         entry["name"] = clean_name
-        # Aseguramos que 'dados' sea un diccionario
         if "dados" not in entry or not isinstance(entry["dados"], dict): entry["dados"] = {}
     return stats[uid]
 
@@ -228,53 +236,41 @@ class DiceBot(discord.Client):
                     else: await message.add_reaction("🎲")
                 except: pass
 
-    # --- ARREGLO DEFINITIVO DE cmd_marcador ---
     async def cmd_marcador(self, message):
         if not self.stats:
             await message.channel.send("📊 No hay estadísticas.")
             return
 
-        # Ordenar por críticos (descendente)
         sorted_players = sorted(self.stats.items(), key=lambda kv: kv[1].get("criticos", 0), reverse=True)
         lines = ["📊 **Marcador de dados**\n"]
 
         for uid, data in sorted_players:
-            # 1. Identificar al usuario (mención o nombre en negrita)
             name_display = f"<@{uid}>" if uid.isdigit() else f"**{data.get('name', uid)}**"
-            
-            # 2. Resumen global
             lines.append(f"{name_display} — 🎯: `{data.get('criticos',0)}` | 💀: `{data.get('pifias',0)}` | **Total: {data.get('tiradas',0)}**")
 
-            # 3. Desglose detallado de dados
             dados_dict = data.get("dados", {})
             if isinstance(dados_dict, dict) and dados_dict:
-                # Ordenar los dados (d2, d6, d20...) numéricamente
                 try:
                     sorted_dados = sorted(
                         dados_dict.items(),
                         key=lambda x: int(re.sub(r"\D", "", x[0])) if re.sub(r"\D", "", x[0]).isdigit() else 0
                     )
                 except:
-                    sorted_dados = dados_dict.items() # Fallback si falla el ordenamiento
+                    sorted_dados = dados_dict.items()
 
                 desglose_parts = []
                 for dado_key, dado_val in sorted_dados:
-                    # Asegurar que el valor sea un diccionario (anti-corrupción)
                     if isinstance(dado_val, dict):
                         tiradas = dado_val.get("tiradas", 0)
                         if tiradas > 0:
                             desglose_parts.append(f"{dado_key}: {tiradas}")
                     elif isinstance(dado_val, int):
-                        # Caso backup por si quedó algún dato viejo en formato int
                         if dado_val > 0: desglose_parts.append(f"{dado_key}: {dado_val}")
 
                 if desglose_parts:
                     lines.append(f"> 🎲 Desglose: " + " | ".join(desglose_parts))
-            
-            # Línea en blanco para separar jugadores
             lines.append("")
 
-        # Envío seguro (anti-límite de 2000 caracteres)
         full_msg = "\n".join(lines)
         if len(full_msg) > 1900:
             for i in range(0, len(lines), 5): await self.safe_send(message.channel, "\n".join(lines[i:i+5]))
@@ -287,7 +283,6 @@ class DiceBot(discord.Client):
             embed = discord.Embed(title=f"📊 Estadísticas de {data.get('name', uid)}", color=0x7289da)
             embed.add_field(name="Global", value=f"🎯 Críticos: **{data.get('criticos',0)}**\n💀 Pifias: **{data.get('pifias',0)}**\n🎲 Total: **{data.get('tiradas',0)}**")
             
-            # Desglose en estadísticas individuales
             ds = data.get("dados", {})
             if isinstance(ds, dict) and ds:
                 txt = "\n".join([f"**{k}**: {v['tiradas']} tiradas | 🎯 {v['criticos']} | 💀 {v['pifias']}" for k, v in sorted(ds.items(), key=lambda x: int(re.sub(r'\D','',x[0])) if re.sub(r'\D','',x[0]).isdigit() else 0) if isinstance(v,dict) and v['tiradas'] > 0])
@@ -332,8 +327,8 @@ class DiceBot(discord.Client):
 # --- ARRANQUE ---
 async def main():
     token = os.environ.get("DISCORD_TOKEN")
-    if not token:
-        print("Error: TOKEN no encontrado.")
+    if not token or not MONGO_URI:
+        print("Error: TOKEN o MONGO_URI no encontrado.")
         return
     keep_alive()
     while True:
