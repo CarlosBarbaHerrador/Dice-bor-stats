@@ -1,25 +1,10 @@
 app = "dice-bor-stats"
 primary_region = "iad"
 
-[build]
-
 [[services]]
   internal_port = 8080
   protocol = "tcp"
 
   [[services.ports]]
-    port = 80
+    port = 8080
     handlers = ["http"]
-    force_https = true
-
-  [[services.ports]]
-    port = 443
-    handlers = ["tls", "http"]
-
-  [[services.ports]]
-    port = 8082
-    handlers = ["http"]
-
-  [services.concurrency]
-    type = "requests"
-    hard_limit = 100
