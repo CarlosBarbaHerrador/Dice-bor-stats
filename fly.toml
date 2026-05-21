@@ -1,6 +1,9 @@
 app = "dice-bor-stats"
 primary_region = "iad"
 
+[build]
+  dockerfile = "Dockerfile"
+
 [[services]]
   internal_port = 8080
   protocol = "tcp"

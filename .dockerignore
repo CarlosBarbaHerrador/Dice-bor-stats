@@ -1,0 +1,15 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+node_modules
+.npmrc
+package.json
+pnpm-lock.yaml
+pnpm-workspace.yaml
+tsconfig*.json
+tsconfig.base.json
+.replit
+.replitignore
+replit.md
+uv.lock
