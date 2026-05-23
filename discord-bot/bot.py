@@ -432,22 +432,30 @@ class DiceBot(discord.Client):
         if stats_changed:
             save_stats(stats)
 
-        lines = ["📊 **Marcador de dados**\n"]
-        total_servidor = 0
+        total_servidor = sum(data.get("tiradas", 0) for _, data in sorted_players)
 
-        for uid, data in sorted_players:
-            name_display = f"<@{uid}>" if uid.isdigit() else f"**{data.get('name', uid)}**"
+        MEDALS = ["🥇", "🥈", "🥉"]
+        lines = []
+
+        def dado_sort_key(k: str) -> int:
+            try:
+                return int(k[1:])
+            except ValueError:
+                return 0
+
+        for i, (uid, data) in enumerate(sorted_players):
+            pos = i + 1
+            medal = MEDALS[i] if i < 3 else f"#{pos}"
+
+            name_display = f"<@{uid}>" if uid.isdigit() else data.get("name", uid)
             criticos = data.get("criticos", 0)
             pifias = data.get("pifias", 0)
             tiradas = data.get("tiradas", 0)
-            total_servidor += tiradas
             dados: dict = data.get("dados", {})
 
-            def dado_sort_key(k: str) -> int:
-                try:
-                    return int(k[1:])
-                except ValueError:
-                    return 0
+            c_text = f"{criticos} crítico{'s' if criticos != 1 else ''}"
+            p_text = f"{pifias} pifia{'s' if pifias != 1 else ''}"
+            t_text = f"{tiradas} tirada{'s' if tiradas != 1 else ''}"
 
             if dados:
                 desglose_parts = []
@@ -455,16 +463,23 @@ class DiceBot(discord.Client):
                     t = val["tiradas"] if isinstance(val, dict) else val
                     if t > 0:
                         desglose_parts.append(f"{dado}: {t}")
-                desglose = " | ".join(desglose_parts) if desglose_parts else "sin datos"
+                desglose = " | ".join(desglose_parts)
             else:
-                desglose = "sin datos"
+                desglose = ""
 
-            lines.append(
-                f"{name_display} — 🎯: `{criticos}` | 💀: `{pifias}` | 🎲 {desglose} | **Total: {tiradas}**"
-            )
+            line = f"{medal} {name_display} — 🎯 {c_text} | 💀 {p_text}"
+            if desglose:
+                line += f"\n└ 🎲 {desglose}"
+            line += f"\n╰ **{t_text}**"
+            lines.append(line)
 
-        lines.append(f"{'─' * 35}\n🎲 Total de dados lanzados en el servidor: **{total_servidor}**")
-        await message.channel.send("\n".join(lines))
+        embed = discord.Embed(
+            title="📊 Marcador de dados",
+            color=discord.Color.gold(),
+            description="\n\n".join(lines),
+        )
+        embed.set_footer(text=f"🎲 Total de dados lanzados: {total_servidor}")
+        await message.channel.send(embed=embed)
 
     async def cmd_estadisticas(self, message: discord.Message):
         stats = self.stats
