@@ -2,34 +2,108 @@ import discord
 import re
 import json
 import os
+import pymongo
+from pymongo import MongoClient
 from pathlib import Path
 from keep_alive import keep_alive
 
-STATS_FILE = Path(__file__).parent / "stats.json"
+# --- CONFIGURACIÓN DE BASE DE DATOS (MongoDB + fallback local) ---
+MONGO_URI = os.environ.get("MONGO_URI")
+if MONGO_URI:
+    MONGO_URI_DEBUG = MONGO_URI[:20] + "..." + MONGO_URI[-10:] if len(MONGO_URI) > 30 else "configurada"
+    print(f"[MONGO] URI detectada: {MONGO_URI_DEBUG}")
+    try:
+        cluster = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+        db = cluster["DB-DICE"]
+        collection = db["stats"]
+        cluster.admin.command("ping")
+        print("[MONGO] ✅ Conexión exitosa a MongoDB Atlas")
+    except Exception as e:
+        print(f"[MONGO] ❌ Error conectando a MongoDB: {type(e).__name__}: {e}")
+        print("[MONGO] ⚠️ Se usará stats.json como respaldo local")
+        collection = None
+else:
+    print("[MONGO] ⚠️ MONGO_URI no configurada. Usando stats.json como respaldo local.")
+    collection = None
 
+STATS_FILE = Path(__file__).parent / "stats.json"
 MENTION_IN_EMBED_PATTERN = re.compile(r"<@!?(\d+)>")
 MARKDOWN_BOLD = re.compile(r"\*{1,2}")
 
 
 def strip_markdown(text: str) -> str:
-    """Elimina asteriscos de negrita/cursiva de un texto."""
     return MARKDOWN_BOLD.sub("", text).strip()
 
 
+def save_stats(stats: dict) -> None:
+    if not stats:
+        print("[SAVE] ⚠️ No hay datos para guardar")
+        return
+    # Siempre guardar local como respaldo
+    try:
+        with open(STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[SAVE] ❌ Error guardando stats.json: {e}")
+
+    # Guardar en MongoDB si está disponible
+    if collection is not None:
+        try:
+            result = collection.replace_one({"_id": "global_stats"}, stats, upsert=True)
+            if result.acknowledged:
+                accion = "actualizado" if result.matched_count > 0 else "creado nuevo"
+                print(f"[SAVE] ✅ MongoDB: documento {accion}")
+            else:
+                print("[SAVE] ⚠️ MongoDB: escritura no reconocida")
+        except Exception as e:
+            print(f"[SAVE] ❌ MongoDB: {type(e).__name__}: {e}")
+
+
 def load_stats() -> dict:
+    print("[LOAD] Cargando estadísticas...")
+    # Intentar desde MongoDB primero
+    if collection is not None:
+        try:
+            data = collection.find_one({"_id": "global_stats"})
+            if data:
+                stats = dict(data)
+                del stats["_id"]
+                print(f"[LOAD] ✅ Cargados {len(stats)} usuarios desde MongoDB")
+                # Actualizar respaldo local
+                try:
+                    with open(STATS_FILE, "w", encoding="utf-8") as f:
+                        json.dump(stats, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+                return stats
+            print("[LOAD] ⚠️ No hay documento global_stats en MongoDB")
+        except Exception as e:
+            print(f"[LOAD] ❌ MongoDB: {type(e).__name__}: {e}")
+
+    # Fallback a stats.json
     if STATS_FILE.exists():
-        with open(STATS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(STATS_FILE, "r", encoding="utf-8") as f:
+                local_data = json.load(f)
+            if local_data:
+                print(f"[LOAD] 📄 Cargados {len(local_data)} usuarios desde stats.json (respaldo)")
+                # Intentar migrar a MongoDB
+                if collection is not None:
+                    try:
+                        collection.replace_one({"_id": "global_stats"}, local_data, upsert=True)
+                        print("[LOAD] 🚀 Datos migrados a MongoDB")
+                    except Exception as e:
+                        print(f"[LOAD] ⚠️ No se pudo migrar a MongoDB: {e}")
+                return local_data
+        except Exception as e:
+            print(f"[LOAD] ❌ Error leyendo stats.json: {e}")
+    else:
+        print("[LOAD] ℹ️ No hay stats.json. Iniciando vacío.")
+
     return {}
 
 
-def save_stats(stats: dict) -> None:
-    with open(STATS_FILE, "w", encoding="utf-8") as f:
-        json.dump(stats, f, ensure_ascii=False, indent=2)
-
-
 def get_dado_sub(dados: dict, dado_key: str) -> dict:
-    """Devuelve (y crea si falta) el subdict {tiradas, criticos, pifias} de un dado."""
     val = dados.get(dado_key)
     if not isinstance(val, dict):
         dados[dado_key] = {"tiradas": val if isinstance(val, int) else 0, "criticos": 0, "pifias": 0}
@@ -37,7 +111,6 @@ def get_dado_sub(dados: dict, dado_key: str) -> dict:
 
 
 def merge_entry(target: dict, source: dict) -> None:
-    """Suma las estadísticas de source en target, incluyendo el desglose de dados."""
     target["criticos"] = target.get("criticos", 0) + source.get("criticos", 0)
     target["pifias"] = target.get("pifias", 0) + source.get("pifias", 0)
     target["tiradas"] = target.get("tiradas", 0) + source.get("tiradas", 0)
@@ -53,11 +126,6 @@ def merge_entry(target: dict, source: dict) -> None:
 
 
 def migrate_stats(stats: dict) -> dict:
-    """
-    - Elimina asteriscos de claves y nombres.
-    - Migra claves "user_XXXXXXX" → "XXXXXXX".
-    - Fusiona entradas duplicadas detectadas por nombre normalizado.
-    """
     changed = False
     new_stats: dict = {}
 
@@ -73,15 +141,11 @@ def migrate_stats(stats: dict) -> dict:
         if clean_key in new_stats:
             merge_entry(new_stats[clean_key], data)
             changed = True
-            print(f"[Migración] Fusionadas entradas duplicadas: '{key}' → '{clean_key}'")
         else:
             new_stats[clean_key] = data
             if clean_key != key:
                 changed = True
-                print(f"[Migración] Clave renombrada: '{key}' → '{clean_key}'")
 
-    # Asegurarse de que todas las entradas tengan el campo "dados"
-    # y que cada dado sea un dict {tiradas, criticos, pifias}
     for data in new_stats.values():
         if "dados" not in data:
             data["dados"] = {}
@@ -95,7 +159,7 @@ def migrate_stats(stats: dict) -> dict:
         stats.clear()
         stats.update(new_stats)
         save_stats(stats)
-        print(f"[Migración] Stats guardadas. Total de jugadores: {len(stats)}")
+        print(f"[MIGRATE] Stats normalizadas. {len(stats)} jugadores.")
 
     return stats
 
@@ -113,7 +177,6 @@ def get_or_create_entry(stats: dict, uid: str, display_name: str) -> dict:
     else:
         entry = stats[uid]
         if entry.get("name") != clean_name:
-            print(f"[Nombre actualizado] {entry['name']} → {clean_name}")
             entry["name"] = clean_name
         if "dados" not in entry:
             entry["dados"] = {}
@@ -152,7 +215,6 @@ def register_roll(
 
 
 def resolve_member_by_name(guild: discord.Guild, name: str) -> discord.Member | None:
-    """Busca miembro por display_name o name (sin distinción de mayúsculas)."""
     clean = strip_markdown(name).lower()
     for member in guild.members:
         if member.display_name.lower() == clean or member.name.lower() == clean:
@@ -164,10 +226,6 @@ async def find_command_invoker(
     channel: discord.abc.Messageable,
     bot_message: discord.Message,
 ) -> discord.Member | None:
-    """
-    Busca en el historial reciente el último mensaje de un humano
-    antes del mensaje del bot de dados, que sea el comando de tirada.
-    """
     try:
         async for msg in channel.history(limit=10, before=bot_message):
             if not msg.author.bot:
@@ -183,51 +241,49 @@ class DiceBot(discord.Client):
         intents.message_content = True
         intents.members = True
         super().__init__(intents=intents)
+        self.stats = {}
 
     async def on_ready(self):
-        print(f"Bot conectado como {self.user} (ID: {self.user.id})")
-        stats = load_stats()
-        migrate_stats(stats)
+        print(f"🤖 Bot conectado como {self.user} (ID: {self.user.id})")
+        self.stats = load_stats()
+        self.stats = migrate_stats(self.stats)
+        if self.stats:
+            print(f"[INIT] 📊 {len(self.stats)} jugadores en memoria")
+        else:
+            print("[INIT] 📊 Base de datos vacía. Esperando primeras tiradas...")
 
     async def on_message(self, message: discord.Message):
-        stats = load_stats()
+        if message.author == self.user:
+            return
 
         if message.content.startswith("!marcador"):
-            await self.cmd_marcador(message, stats)
+            await self.cmd_marcador(message)
             return
 
         if message.content.startswith("!estadisticas"):
-            await self.cmd_estadisticas(message, stats)
+            await self.cmd_estadisticas(message)
             return
 
         if message.content.startswith("!set"):
-            await self.cmd_set(message, stats)
+            await self.cmd_set(message)
             return
 
         if message.content.startswith("!remove"):
-            await self.cmd_remove(message, stats)
+            await self.cmd_remove(message)
             return
 
         bot_name = message.author.name.lower()
 
         if "dice maiden" in bot_name or "dicemaiden" in bot_name:
-            await self.handle_dice_maiden(message, stats)
+            await self.handle_dice_maiden(message)
         elif "avrae" in bot_name:
-            await self.handle_avrae(message, stats)
+            await self.handle_avrae(message)
 
     async def resolve_player(
         self,
         content: str,
         message: discord.Message,
     ) -> tuple[str, str] | None:
-        """
-        Intenta obtener (uid, display_name) de un mensaje:
-        1. Mención directa en el contenido.
-        2. Nombre entre 🎲 y Request → busca miembro en el servidor.
-        3. Historial del canal → primer humano antes del mensaje.
-        Devuelve None si no puede identificar al jugador.
-        """
-        # 1. Mención directa
         mention_match = MENTION_IN_EMBED_PATTERN.search(content)
         if mention_match:
             uid = mention_match.group(1)
@@ -235,7 +291,6 @@ class DiceBot(discord.Client):
             display_name = member.display_name if member else f"Usuario {uid}"
             return uid, display_name
 
-        # 2. Nombre entre 🎲 y Request
         name_match = re.search(r"🎲\s*(.*?)\s+Request\b", content, re.IGNORECASE)
         if name_match:
             extracted = strip_markdown(name_match.group(1).strip())
@@ -246,16 +301,14 @@ class DiceBot(discord.Client):
             uid = extracted.lower().replace(" ", "_")
             return uid, extracted
 
-        # 3. Historial: quien ejecutó el comando
         invoker = await find_command_invoker(message.channel, message)
         if invoker:
             return str(invoker.id), invoker.display_name
 
         return None
 
-    async def handle_dice_maiden(self, message: discord.Message, stats: dict):
+    async def handle_dice_maiden(self, message: discord.Message):
         content = message.content
-
         roll_match = re.search(
             r"(\d+)d(\d+).*?Roll:.*?\[(\d+)\]",
             content,
@@ -272,14 +325,13 @@ class DiceBot(discord.Client):
             return
 
         uid, display_name = player
-        msg = register_roll(stats, uid, display_name, resultado, caras)
+        msg = register_roll(self.stats, uid, display_name, resultado, caras)
         if msg:
             await message.channel.send(msg)
 
-    async def handle_avrae(self, message: discord.Message, stats: dict):
+    async def handle_avrae(self, message: discord.Message):
         content = message.content
 
-        # Recopilar texto del mensaje y sus embeds (por si usa ambos)
         embed_parts: list[str] = []
         if message.embeds:
             for embed in message.embeds:
@@ -296,13 +348,8 @@ class DiceBot(discord.Client):
                         embed_parts.append(field.value)
 
         full_text = content + ("\n" + "\n".join(embed_parts) if embed_parts else "")
-
-        # Avrae usa negritas (**) alrededor de los números. Las eliminamos antes
-        # de aplicar el regex para que "(**1**)" se convierta en "(1)".
         clean_text = re.sub(r"\*+", "", full_text)
 
-        # Patrón principal (indicado por el usuario):
-        # "Result: 1d20 (20)" → grupo 1 = caras, grupo 2 = resultado
         roll_match = re.search(
             r"Result:.*?\d+d(\d+)\s*\((\d+)\)",
             clean_text,
@@ -312,7 +359,6 @@ class DiceBot(discord.Client):
             caras = int(roll_match.group(1))
             resultado = int(roll_match.group(2))
         else:
-            # Fallback general: "1d20 (20)"
             roll_match = re.search(
                 r"(\d+)d(\d+)[^()\n]*\((\d+)\)",
                 clean_text,
@@ -324,8 +370,6 @@ class DiceBot(discord.Client):
             else:
                 return
 
-        # Identificar al jugador por la mención en message.content
-        # Avrae formato: "<@ID>  :game_die:\n**Result**: ..."
         uid: str | None = None
         mention_match = MENTION_IN_EMBED_PATTERN.search(content)
         if mention_match:
@@ -351,8 +395,7 @@ class DiceBot(discord.Client):
                 uid = "unknown"
                 display_name = "Jugador desconocido"
 
-        # Registrar y reaccionar directamente al mensaje de Avrae
-        register_roll(stats, uid, display_name, resultado, caras)
+        register_roll(self.stats, uid, display_name, resultado, caras)
 
         if resultado == caras:
             await message.add_reaction("🎯")
@@ -367,7 +410,8 @@ class DiceBot(discord.Client):
         else:
             await message.add_reaction("🎲")
 
-    async def cmd_marcador(self, message: discord.Message, stats: dict):
+    async def cmd_marcador(self, message: discord.Message):
+        stats = self.stats
         if not stats:
             await message.channel.send("📊 No hay estadísticas registradas aún.")
             return
@@ -378,7 +422,6 @@ class DiceBot(discord.Client):
             reverse=True,
         )
 
-        # Actualizar nombres si el miembro sigue en el servidor
         stats_changed = False
         for uid, data in sorted_players:
             if uid.isdigit() and message.guild:
@@ -394,13 +437,10 @@ class DiceBot(discord.Client):
 
         for uid, data in sorted_players:
             name_display = f"<@{uid}>" if uid.isdigit() else f"**{data.get('name', uid)}**"
-
             criticos = data.get("criticos", 0)
             pifias = data.get("pifias", 0)
             tiradas = data.get("tiradas", 0)
             total_servidor += tiradas
-
-            # Desglose de dados ordenado numéricamente
             dados: dict = data.get("dados", {})
 
             def dado_sort_key(k: str) -> int:
@@ -426,13 +466,12 @@ class DiceBot(discord.Client):
         lines.append(f"{'─' * 35}\n🎲 Total de dados lanzados en el servidor: **{total_servidor}**")
         await message.channel.send("\n".join(lines))
 
-
-    async def cmd_estadisticas(self, message: discord.Message, stats: dict):
+    async def cmd_estadisticas(self, message: discord.Message):
+        stats = self.stats
         if not stats:
             await message.channel.send("📊 No hay estadísticas registradas aún.")
             return
 
-        # Determinar si se filtra por un usuario concreto
         mention_match = MENTION_IN_EMBED_PATTERN.search(message.content)
         if mention_match:
             uid_filter = mention_match.group(1)
@@ -494,12 +533,10 @@ class DiceBot(discord.Client):
 
             await message.channel.send(content=name_display, embed=embed)
 
-
-    async def cmd_set(self, message: discord.Message, stats: dict):
-        # Campos globales
+    async def cmd_set(self, message: discord.Message):
+        stats = self.stats
         CAMPOS_GLOBALES = {"criticos", "pifias", "tiradas"}
         CAMPO_LABEL = {"criticos": "Críticos", "pifias": "Pifias", "tiradas": "Tiradas"}
-        # Campos por dado: patrón d<N>_(criticos|pifias|tiradas)
         DADO_SUB_PATTERN = re.compile(r"^(d\d+)_(criticos|pifias|tiradas)$")
 
         if not message.guild:
@@ -546,7 +583,6 @@ class DiceBot(discord.Client):
             stats[uid].setdefault("dados", {})
             stats[uid]["name"] = display_name
 
-        # Campo global
         if campo in CAMPOS_GLOBALES:
             stats[uid][campo] = valor
             save_stats(stats)
@@ -555,14 +591,12 @@ class DiceBot(discord.Client):
             )
             return
 
-        # Campo por dado (d20_criticos, d10_pifias, etc.)
         dado_match = DADO_SUB_PATTERN.match(campo)
         if dado_match:
             dado_key = dado_match.group(1)
             sub_campo = dado_match.group(2)
             dado_sub = get_dado_sub(stats[uid]["dados"], dado_key)
             dado_sub[sub_campo] = valor
-            # Recalcular totales globales desde los dados
             stats[uid]["tiradas"] = sum(
                 (v.get("tiradas", 0) if isinstance(v, dict) else v)
                 for v in stats[uid]["dados"].values()
@@ -585,8 +619,8 @@ class DiceBot(discord.Client):
             "  Campos por dado: `d20_criticos`, `d20_pifias`, `d20_tiradas`, etc."
         )
 
-
-    async def cmd_remove(self, message: discord.Message, stats: dict):
+    async def cmd_remove(self, message: discord.Message):
+        stats = self.stats
         if not message.guild:
             await message.channel.send("❌ Este comando solo puede usarse en un servidor.")
             return
@@ -601,14 +635,12 @@ class DiceBot(discord.Client):
 
         removed: list[str] = []
 
-        # 1. Limpieza automática: eliminar entradas sin ID numérico
         non_numeric = [k for k in list(stats.keys()) if not k.isdigit()]
         for key in non_numeric:
             entry_name = stats[key].get("name", key)
             del stats[key]
             removed.append(entry_name)
 
-        # 2. Si se indicó un nombre, buscar y borrar esa entrada concreta
         if target_name:
             target_lower = target_name.lower()
             keys_to_delete = [
