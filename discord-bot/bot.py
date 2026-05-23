@@ -416,14 +416,8 @@ class DiceBot(discord.Client):
             await message.channel.send("📊 No hay estadísticas registradas aún.")
             return
 
-        sorted_players = sorted(
-            stats.items(),
-            key=lambda kv: kv[1].get("criticos", 0),
-            reverse=True,
-        )
-
         stats_changed = False
-        for uid, data in sorted_players:
+        for uid, data in stats.items():
             if uid.isdigit() and message.guild:
                 member = message.guild.get_member(int(uid))
                 if member and data.get("name") != member.display_name:
@@ -432,9 +426,7 @@ class DiceBot(discord.Client):
         if stats_changed:
             save_stats(stats)
 
-        total_servidor = sum(data.get("tiradas", 0) for _, data in sorted_players)
-
-        MEDALS = ["🥇", "🥈", "🥉"]
+        total_servidor = sum(data.get("tiradas", 0) for _, data in stats.items())
         lines = []
 
         def dado_sort_key(k: str) -> int:
@@ -443,19 +435,12 @@ class DiceBot(discord.Client):
             except ValueError:
                 return 0
 
-        for i, (uid, data) in enumerate(sorted_players):
-            pos = i + 1
-            medal = MEDALS[i] if i < 3 else f"#{pos}"
-
-            name_display = f"<@{uid}>" if uid.isdigit() else data.get("name", uid)
+        for uid, data in stats.items():
+            name_display = f"**{data.get('name', uid)}**" if uid.isdigit() else data.get("name", uid)
             criticos = data.get("criticos", 0)
             pifias = data.get("pifias", 0)
             tiradas = data.get("tiradas", 0)
             dados: dict = data.get("dados", {})
-
-            c_text = f"{criticos} crítico{'s' if criticos != 1 else ''}"
-            p_text = f"{pifias} pifia{'s' if pifias != 1 else ''}"
-            t_text = f"{tiradas} tirada{'s' if tiradas != 1 else ''}"
 
             if dados:
                 desglose_parts = []
@@ -467,10 +452,14 @@ class DiceBot(discord.Client):
             else:
                 desglose = ""
 
-            line = f"{medal} {name_display} — 🎯 {c_text} | 💀 {p_text}"
+            c_text = f"🎯 {criticos} crítico{'s' if criticos != 1 else ''}"
+            p_text = f"💀 {pifias} pifia{'s' if pifias != 1 else ''}"
+            t_text = f"🎲 {tiradas} tirada{'s' if tiradas != 1 else ''}"
+
             if desglose:
-                line += f"\n└ 🎲 {desglose}"
-            line += f"\n╰ **{t_text}**"
+                line = f"{name_display}\n└ {c_text} | {p_text}\n└ {desglose}\n╰ **{t_text}**"
+            else:
+                line = f"{name_display}\n└ {c_text} | {p_text}\n╰ **{t_text}**"
             lines.append(line)
 
         embed = discord.Embed(
@@ -487,31 +476,22 @@ class DiceBot(discord.Client):
             await message.channel.send("📊 No hay estadísticas registradas aún.")
             return
 
-        mention_match = MENTION_IN_EMBED_PATTERN.search(message.content)
-        if mention_match:
-            uid_filter = mention_match.group(1)
-            players = [(uid_filter, stats[uid_filter])] if uid_filter in stats else []
-            if not players:
-                await message.channel.send("⚠️ Ese usuario no tiene estadísticas registradas.")
-                return
-        else:
-            players = sorted(
-                stats.items(),
-                key=lambda kv: kv[1].get("criticos", 0),
-                reverse=True,
-            )
-
         def dado_sort_key(k: str) -> int:
             try:
                 return int(k[1:])
             except ValueError:
                 return 0
 
-        for uid, data in players:
-            name_display = f"<@{uid}>" if uid.isdigit() else data.get("name", uid)
+        mention_match = MENTION_IN_EMBED_PATTERN.search(message.content)
+        if mention_match:
+            uid_filter = mention_match.group(1)
+            data = stats.get(uid_filter)
+            if not data:
+                await message.channel.send("⚠️ Ese usuario no tiene estadísticas registradas.")
+                return
 
             embed = discord.Embed(
-                title=f"📊 Estadísticas de {data.get('name', uid)}",
+                title=f"📊 Estadísticas de {data.get('name', uid_filter)}",
                 color=discord.Color.blurple(),
             )
             embed.add_field(
@@ -523,7 +503,6 @@ class DiceBot(discord.Client):
                 ),
                 inline=False,
             )
-
             dados: dict = data.get("dados", {})
             if dados:
                 lines_dado = []
@@ -537,16 +516,43 @@ class DiceBot(discord.Client):
                     if t > 0:
                         lines_dado.append(f"**{dado}**: {t} tiradas | 🎯 {c} | 💀 {p}")
                 if lines_dado:
-                    embed.add_field(
-                        name="Desglose por dado",
-                        value="\n".join(lines_dado),
-                        inline=False,
-                    )
+                    embed.add_field(name="Desglose por dado", value="\n".join(lines_dado), inline=False)
+            await message.channel.send(embed=embed)
+            return
 
-            if uid.isdigit():
-                embed.set_footer(text=f"ID: {uid}")
+        embed = discord.Embed(
+            title="📊 Estadísticas del servidor",
+            color=discord.Color.blurple(),
+        )
+        for uid, data in stats.items():
+            name = data.get("name", uid)
+            criticos = data.get("criticos", 0)
+            pifias = data.get("pifias", 0)
+            tiradas = data.get("tiradas", 0)
+            c_text = f"🎯 {criticos} crítico{'s' if criticos != 1 else ''}"
+            p_text = f"💀 {pifias} pifia{'s' if pifias != 1 else ''}"
+            t_text = f"🎲 {tiradas} tirada{'s' if tiradas != 1 else ''}"
+            global_text = f"{c_text} | {p_text} | **{t_text}**"
 
-            await message.channel.send(content=name_display, embed=embed)
+            dados: dict = data.get("dados", {})
+            if dados:
+                lines_dado = []
+                for dado, val in sorted(dados.items(), key=lambda x: dado_sort_key(x[0])):
+                    if isinstance(val, dict):
+                        t = val.get("tiradas", 0)
+                        c = val.get("criticos", 0)
+                        p = val.get("pifias", 0)
+                    else:
+                        t, c, p = val, 0, 0
+                    if t > 0:
+                        lines_dado.append(f"**{dado}**: {t} tiradas | 🎯 {c} | 💀 {p}")
+                field_value = f"{global_text}\n└ " + "\n└ ".join(lines_dado)
+            else:
+                field_value = global_text
+
+            embed.add_field(name=f"🎲 {name}", value=field_value, inline=False)
+
+        await message.channel.send(embed=embed)
 
     async def cmd_set(self, message: discord.Message):
         stats = self.stats
