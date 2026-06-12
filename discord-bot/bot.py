@@ -274,7 +274,7 @@ class DiceBot(discord.Client):
 
         bot_name = message.author.name.lower()
 
-        if "dice maiden" in bot_name or "dicemaiden" in bot_name:
+        if "dice maiden" in bot_name or "dicemaiden" in bot_name or "dado" in bot_name:
             await self.handle_dice_maiden(message)
         elif "avrae" in bot_name:
             await self.handle_avrae(message)
@@ -310,7 +310,7 @@ class DiceBot(discord.Client):
     async def handle_dice_maiden(self, message: discord.Message):
         content = message.content
         roll_match = re.search(
-            r"(\d+)d(\d+).*?Roll:.*?\[(\d+)\]",
+            r"(\d*)d(\d+).*?Roll:.*?\[(\d+)\]",
             content,
             re.IGNORECASE | re.DOTALL,
         )
@@ -350,26 +350,51 @@ class DiceBot(discord.Client):
         full_text = content + ("\n" + "\n".join(embed_parts) if embed_parts else "")
         clean_text = re.sub(r"\*+", "", full_text)
 
-        roll_match = re.search(
-            r"Result:.*?\d+d(\d+)\s*\((\d+)\)",
-            clean_text,
+        # Find ALL rolls with their mentions (handles multi-roll messages)
+        roll_pattern = re.compile(
+            r"(<@!?\d+>)[\s\S]*?Result:\s*(?:\d+)?d(\d+)\s*\((\d+)\)",
             re.IGNORECASE,
         )
-        if roll_match:
-            caras = int(roll_match.group(1))
-            resultado = int(roll_match.group(2))
-        else:
-            roll_match = re.search(
+        matches = list(roll_pattern.finditer(clean_text))
+
+        if not matches:
+            # Fallback: parenthetical format without "Result:"
+            fallback_pattern = re.compile(
                 r"(\d+)d(\d+)[^()\n]*\((\d+)\)",
-                clean_text,
                 re.IGNORECASE,
             )
-            if roll_match:
-                caras = int(roll_match.group(2))
-                resultado = int(roll_match.group(3))
-            else:
+            fallback_matches = list(fallback_pattern.finditer(clean_text))
+            if not fallback_matches:
                 return
 
+            uid, display_name = await self._resolve_avrae_player(message, content)
+            for fm in fallback_matches:
+                caras = int(fm.group(2))
+                resultado = int(fm.group(3))
+                await self._process_avrae_roll(
+                    message, uid, display_name, resultado, caras
+                )
+            return
+
+        for match in matches:
+            mention = match.group(1)
+            caras = int(match.group(2))
+            resultado = int(match.group(3))
+
+            m = MENTION_IN_EMBED_PATTERN.match(mention)
+            uid = m.group(1) if m else "unknown"
+            member = message.guild.get_member(int(uid)) if uid.isdigit() and message.guild else None
+            display_name = member.display_name if member else f"Usuario {uid}"
+
+            await self._process_avrae_roll(
+                message, uid, display_name, resultado, caras
+            )
+
+    async def _resolve_avrae_player(
+        self,
+        message: discord.Message,
+        content: str,
+    ) -> tuple[str, str]:
         uid: str | None = None
         mention_match = MENTION_IN_EMBED_PATTERN.search(content)
         if mention_match:
@@ -385,28 +410,30 @@ class DiceBot(discord.Client):
 
         if uid:
             member = message.guild.get_member(int(uid)) if message.guild else None
-            display_name = member.display_name if member else f"Usuario {uid}"
-        else:
-            invoker = await find_command_invoker(message.channel, message)
-            if invoker:
-                uid = str(invoker.id)
-                display_name = invoker.display_name
-            else:
-                uid = "unknown"
-                display_name = "Jugador desconocido"
+            return uid, member.display_name if member else f"Usuario {uid}"
 
-        register_roll(self.stats, uid, display_name, resultado, caras)
+        invoker = await find_command_invoker(message.channel, message)
+        if invoker:
+            return str(invoker.id), invoker.display_name
+
+        return "unknown", "Jugador desconocido"
+
+    async def _process_avrae_roll(
+        self,
+        message: discord.Message,
+        uid: str,
+        display_name: str,
+        resultado: int,
+        caras: int,
+    ):
+        msg = register_roll(self.stats, uid, display_name, resultado, caras)
+        if msg:
+            await message.channel.send(msg)
 
         if resultado == caras:
             await message.add_reaction("🎯")
-            await message.channel.send(
-                f"🎯 **¡CRÍTICO!** {display_name} sacó {resultado} en un d{caras}!"
-            )
         elif resultado == 1:
             await message.add_reaction("💀")
-            await message.channel.send(
-                f"💀 **¡PIFIA!** {display_name} sacó 1 en un d{caras}!"
-            )
         else:
             await message.add_reaction("🎲")
 
